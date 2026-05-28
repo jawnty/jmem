@@ -33,6 +33,18 @@ The hook reads Codex's JSON event from stdin, runs `jmem context`, and returns
 
 Codex may require reviewing/trusting the hook through `/hooks` after changes.
 
+## Claude Code Hook
+
+Claude Code reads `/Users/john/.claude/settings.json`. The v0 hook calls:
+
+```bash
+/Users/john/projects/jmem/bin/jmem-claude-hook user-prompt
+```
+
+Claude Code's `UserPromptSubmit` event injects stdout as context, so this hook
+prints the raw `jmem context` packet instead of Codex's JSON wrapper. Claude Code
+may require reviewing/trusting the hook through `/hooks` after changes.
+
 ## Source Policy
 
 Broad index, narrow injection:

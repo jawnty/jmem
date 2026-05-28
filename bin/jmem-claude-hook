@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Claude Code hook entrypoint for jmem."""
+
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from jmem.core import claude_hook_main
+
+if __name__ == "__main__":
+    raise SystemExit(claude_hook_main(sys.argv[1:]))
+

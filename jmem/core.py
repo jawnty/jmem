@@ -710,6 +710,35 @@ def hook_main(argv: list[str]) -> int:
     return 0
 
 
+def claude_hook_main(argv: list[str]) -> int:
+    mode = argv[0] if argv else ""
+    try:
+        event = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        event = {}
+
+    hook_event = event.get("hook_event_name") or event.get("hookEventName")
+    if mode != "user-prompt" and hook_event != "UserPromptSubmit":
+        return 0
+
+    prompt = (
+        event.get("prompt")
+        or event.get("user_prompt")
+        or event.get("userPrompt")
+        or event.get("message")
+        or ""
+    )
+    cwd = event.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    context = build_context(cwd, prompt)
+    event.setdefault("hook_event_name", hook_event or "UserPromptSubmit")
+    event.setdefault("prompt", prompt)
+    event.setdefault("cwd", cwd)
+    log_hook(event, context)
+    if context:
+        print(context)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="jmem")
     sub = parser.add_subparsers(dest="cmd", required=True)
