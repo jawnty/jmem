@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import subprocess
+
+
+ROOT = Path(__file__).resolve().parents[1]
+HOME = Path.home()
+
+
+def plist_text(minute: int) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jmem.granola-sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{ROOT / 'bin/jmem'}</string>
+    <string>granola-sync</string>
+    <string>--index</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Minute</key>
+    <integer>{minute}</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>{ROOT / 'logs/granola-sync.log'}</string>
+
+  <key>StandardErrorPath</key>
+  <string>{ROOT / 'logs/granola-sync.err.log'}</string>
+</dict>
+</plist>
+"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Install hourly Granola sync LaunchAgent on macOS.")
+    parser.add_argument("--minute", type=int, default=23)
+    parser.add_argument("--load", action="store_true", help="Load the LaunchAgent after writing it")
+    args = parser.parse_args()
+    if args.minute < 0 or args.minute > 59:
+        parser.error("--minute must be between 0 and 59")
+    path = HOME / "Library/LaunchAgents/com.jmem.granola-sync.plist"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(plist_text(args.minute))
+    subprocess.run(["plutil", "-lint", str(path)], check=True)
+    print(f"wrote {path}")
+    if args.load:
+        uid = str(os.getuid())
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(path)], check=False)
+        subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(path)], check=True)
+        print("loaded com.jmem.granola-sync")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

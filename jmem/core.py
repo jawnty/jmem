@@ -16,11 +16,13 @@ import urllib.parse
 import urllib.request
 
 
-ROOT = Path(__file__).resolve().parents[1]
+HOME = Path.home()
+PACKAGE_PARENT = Path(__file__).resolve().parents[1]
+DEFAULT_ROOT = PACKAGE_PARENT if (PACKAGE_PARENT / "bin").exists() else HOME / ".jmem"
+ROOT = Path(os.environ.get("JMEM_HOME", DEFAULT_ROOT)).expanduser()
 DB_PATH = ROOT / "index" / "jmem.sqlite"
 LOG_PATH = ROOT / "logs" / "hooks.jsonl"
-PROJECTS_ROOT = Path("/Users/john/projects")
-HOME = Path.home()
+PROJECTS_ROOT = Path(os.environ.get("JMEM_PROJECTS_ROOT", HOME / "projects")).expanduser()
 
 PROJECT_DOC_NAMES = {"AGENTS.md", "CLAUDE.md", "README.md", "PROGRESS.md", "HEARTBEAT.md"}
 SKIP_DIRS = {
@@ -49,7 +51,9 @@ TRIVIAL_PROMPTS = {
 INDEX_MAX_AGE_SECONDS = 60 * 60
 GRANOLA_API_BASE = "https://public-api.granola.ai/v1"
 GRANOLA_CACHE_DIR = ROOT / "memory" / "granola"
-GRANOLA_STATE = HOME / ".claude/skills/granola-to-drive/state.json"
+GRANOLA_STATE = Path(
+    os.environ.get("JMEM_GRANOLA_STATE", HOME / ".claude/skills/granola-to-drive/state.json")
+).expanduser()
 
 
 def connect() -> sqlite3.Connection:
@@ -97,15 +101,20 @@ def iter_memory_files() -> Iterable[tuple[str, Path]]:
         ("codex_memory", HOME / ".codex/memories/memory_summary.md"),
         ("codex_memory", HOME / ".codex/memories/MEMORY.md"),
         ("clawmail_memory", HOME / ".clawmail/memory/curated.md"),
-        ("claude_memory", HOME / ".claude/projects/-Users-john-projects-maintenance/memory/MEMORY.md"),
     ]
     for source, path in fixed:
         if path.exists():
             yield source, path
 
+    claude_projects = HOME / ".claude/projects"
+    if claude_projects.exists():
+        for memory_dir in sorted(claude_projects.glob("*/memory")):
+            if memory_dir.is_dir():
+                for path in sorted(memory_dir.rglob("*.md")):
+                    yield "claude_memory", path
+
     for pattern, source in [
         (HOME / ".codex/automations", "codex_automation_memory"),
-        (HOME / ".claude/projects/-Users-john-projects-maintenance/memory", "claude_memory"),
         (HOME / ".clawmail/memory/notes", "clawmail_note"),
         (HOME / ".openclaw/memory/notes", "openclaw_note"),
     ]:
@@ -307,7 +316,11 @@ def iter_granola_cache_files() -> Iterable[tuple[str, Path]]:
 def sync_granola_notes(args: argparse.Namespace) -> int:
     token = granola_api_token()
     if not token:
-        print("GRANOLA_API_KEY not found in environment, ~/projects/.env, or ~/.config/granola/api-key", file=sys.stderr)
+        print(
+            "GRANOLA_API_KEY not found in environment, "
+            f"{PROJECTS_ROOT}/.env, or ~/.config/granola/api-key",
+            file=sys.stderr,
+        )
         return 2
     note_ids = granola_state_note_ids()
     if args.recent:
@@ -710,6 +723,10 @@ def hook_main(argv: list[str]) -> int:
     return 0
 
 
+def codex_hook_entry() -> int:
+    return hook_main(["user-prompt"])
+
+
 def claude_hook_main(argv: list[str]) -> int:
     mode = argv[0] if argv else ""
     try:
@@ -737,6 +754,10 @@ def claude_hook_main(argv: list[str]) -> int:
     if context:
         print(context)
     return 0
+
+
+def claude_hook_entry() -> int:
+    return claude_hook_main(["user-prompt"])
 
 
 def main() -> int:

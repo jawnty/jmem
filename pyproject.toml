@@ -1,0 +1,21 @@
+[project]
+name = "jmem"
+version = "0.0.1"
+description = "Local ambient memory hooks for coding agents."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "jmem contributors" }]
+dependencies = []
+
+[project.scripts]
+jmem = "jmem.core:main"
+jmem-codex-hook = "jmem.core:codex_hook_entry"
+jmem-claude-hook = "jmem.core:claude_hook_entry"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["jmem*"]

@@ -1,6 +1,9 @@
 index/
 logs/
 memory/granola/
+.venv/
+.venv-test/
+*.egg-info/
 __pycache__/
 *.pyc
 .DS_Store
