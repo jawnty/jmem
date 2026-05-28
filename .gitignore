@@ -1,5 +1,6 @@
 index/
 logs/
+memory/granola/
 __pycache__/
 *.pyc
 .DS_Store

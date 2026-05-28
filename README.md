@@ -16,6 +16,7 @@ This v0 is deliberately small:
 /Users/john/projects/jmem/bin/jmem stats
 /Users/john/projects/jmem/bin/jmem search "morning brief heartbeat"
 /Users/john/projects/jmem/bin/jmem context --cwd /Users/john/projects/heartbeats --prompt "why did morning brief fail?"
+/Users/john/projects/jmem/bin/jmem granola-sync --index
 ```
 
 ## Codex Hook
@@ -40,4 +41,10 @@ Broad index, narrow injection:
 - It is not fine to inject all of that into every prompt.
 - Context packets are capped and marked as memory hints, not truth. Volatile facts still need live verification.
 
-Granola note ingestion uses `GRANOLA_API_KEY` or `~/.config/granola/api-key` if present. The local `granola.db` file currently appears not to be a plain SQLite database, so v0 does not read it directly.
+Granola note ingestion is part of v0. `jmem granola-sync --index` reads
+`GRANOLA_API_KEY` from the environment, `/Users/john/projects/.env`, or
+`~/.config/granola/api-key`, fetches notes from the official Granola API, and
+caches them under `memory/granola/` for fast local retrieval. The cache is
+gitignored because meeting notes are sensitive. The local `granola.db` file
+currently appears not to be a plain SQLite database, so v0 does not read it
+directly.

@@ -48,6 +48,8 @@ TRIVIAL_PROMPTS = {
 }
 INDEX_MAX_AGE_SECONDS = 60 * 60
 GRANOLA_API_BASE = "https://public-api.granola.ai/v1"
+GRANOLA_CACHE_DIR = ROOT / "memory" / "granola"
+GRANOLA_STATE = HOME / ".claude/skills/granola-to-drive/state.json"
 
 
 def connect() -> sqlite3.Connection:
@@ -142,6 +144,18 @@ def granola_api_token() -> str | None:
         value = os.environ.get(key)
         if value:
             return value.strip()
+    env_file = PROJECTS_ROOT / ".env"
+    try:
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip() == "GRANOLA_API_KEY":
+                    return value.strip().strip('"').strip("'")
+    except Exception:
+        pass
     for path in [
         HOME / ".config/granola/api-key",
         HOME / ".config/granola/token",
@@ -220,6 +234,122 @@ def iter_granola_api_notes(limit: int = 30) -> Iterable[tuple[str, str, str]]:
         yield ("granola_api", f"granola-api:{note_id}", "\n\n".join(bits))
 
 
+def render_granola_note(note_id: str, detail: dict, fallback_title: str = "") -> str:
+    title = detail.get("title") or fallback_title or note_id
+    bits = [
+        f"# {title}",
+        "",
+        f"Granola ID: {note_id}",
+        f"Source: Granola API",
+        f"Created: {detail.get('created_at', '')}",
+        f"Updated: {detail.get('updated_at', '')}",
+    ]
+    if detail.get("web_url"):
+        bits.append(f"URL: {detail.get('web_url')}")
+    calendar = detail.get("calendar_event") or {}
+    if calendar:
+        bits.append(f"Calendar event: {calendar.get('event_title', '')}")
+    attendees = detail.get("attendees") or []
+    if attendees:
+        rendered = []
+        for attendee in attendees:
+            if isinstance(attendee, dict):
+                rendered.append(str(attendee.get("name") or attendee.get("email") or "").strip())
+        if rendered:
+            bits.append("Attendees: " + ", ".join(x for x in rendered if x))
+    for key in ("summary_markdown", "summary_text"):
+        value = detail.get(key)
+        if isinstance(value, str) and value.strip():
+            bits.extend(["", "## Summary", "", value.strip()])
+            break
+    transcript = detail.get("transcript")
+    if isinstance(transcript, list):
+        lines = []
+        for item in transcript:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            speaker = str(item.get("speaker") or item.get("speaker_name") or "").strip()
+            lines.append(f"{speaker}: {text}" if speaker else text)
+        if lines:
+            bits.extend(["", "## Transcript", "", "\n".join(lines)[:80_000]])
+    return "\n".join(bits).strip() + "\n"
+
+
+def granola_state_note_ids() -> dict[str, str]:
+    try:
+        state = json.loads(GRANOLA_STATE.read_text())
+    except Exception:
+        return {}
+    notes = state.get("notes", {})
+    if not isinstance(notes, dict):
+        return {}
+    out: dict[str, str] = {}
+    for note_id, meta in notes.items():
+        if not isinstance(note_id, str):
+            continue
+        title = ""
+        if isinstance(meta, dict):
+            title = str(meta.get("title") or "")
+        out[note_id] = title
+    return out
+
+
+def iter_granola_cache_files() -> Iterable[tuple[str, Path]]:
+    if not GRANOLA_CACHE_DIR.exists():
+        return
+    for path in sorted(GRANOLA_CACHE_DIR.glob("*.md")):
+        yield "granola_api", path
+
+
+def sync_granola_notes(args: argparse.Namespace) -> int:
+    token = granola_api_token()
+    if not token:
+        print("GRANOLA_API_KEY not found in environment, ~/projects/.env, or ~/.config/granola/api-key", file=sys.stderr)
+        return 2
+    note_ids = granola_state_note_ids()
+    if args.recent:
+        try:
+            listed = granola_get_json("/notes", token, {"page_size": str(min(args.recent, 30))})
+            for note in listed.get("notes", [])[:args.recent]:
+                if note.get("id"):
+                    note_ids.setdefault(note["id"], note.get("title") or "")
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            print(f"Granola recent-note listing failed: {exc}", file=sys.stderr)
+            return 1
+    if args.limit:
+        note_ids = dict(list(note_ids.items())[:args.limit])
+    GRANOLA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    fetched = 0
+    skipped = 0
+    failed = 0
+    for idx, (note_id, title) in enumerate(note_ids.items(), start=1):
+        path = GRANOLA_CACHE_DIR / f"{note_id}.md"
+        if path.exists() and not args.force:
+            skipped += 1
+            continue
+        try:
+            detail = granola_get_json(f"/notes/{note_id}", token, {"include": "transcript"})
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            failed += 1
+            if args.verbose:
+                print(f"failed {note_id}: {exc}", file=sys.stderr)
+            continue
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(render_granola_note(note_id, detail, title), encoding="utf-8")
+        tmp.replace(path)
+        fetched += 1
+        if args.verbose and fetched % 10 == 0:
+            print(f"fetched {fetched} / {len(note_ids)}")
+        time.sleep(args.sleep)
+    print(f"granola_sync fetched={fetched} skipped={skipped} failed={failed} cache={GRANOLA_CACHE_DIR}")
+    if args.index:
+        return index_sources(None)
+    return 0
+
+
 def read_text(path: Path) -> str | None:
     try:
         if path.stat().st_size > 2_000_000:
@@ -296,7 +426,8 @@ def index_sources(_: argparse.Namespace | None = None) -> int:
     changed = 0
     files = 0
 
-    for source, path in list(iter_project_docs()) + list(iter_memory_files()):
+    all_files = list(iter_project_docs()) + list(iter_memory_files()) + list(iter_granola_cache_files())
+    for source, path in all_files:
         text = read_text(path)
         if not text:
             continue
@@ -304,7 +435,7 @@ def index_sources(_: argparse.Namespace | None = None) -> int:
         seen_paths.add(str(path))
         changed += upsert_document(conn, source, str(path), title_for(path, text), text, path.stat().st_mtime)
 
-    for source, path, text in list(iter_granola_local_cache()) + list(iter_granola_api_notes()):
+    for source, path, text in iter_granola_local_cache():
         files += 1
         seen_paths.add(path)
         changed += upsert_document(conn, source, path, path, text, time.time())
@@ -600,6 +731,15 @@ def main() -> int:
     p_context.add_argument("--prompt", default="")
     p_context.add_argument("--max-chars", type=int, default=6000)
     p_context.set_defaults(func=cmd_context)
+
+    p_granola = sub.add_parser("granola-sync", help="Fetch Granola notes into the local jmem cache")
+    p_granola.add_argument("--limit", type=int, default=0, help="Limit note fetch count for testing")
+    p_granola.add_argument("--recent", type=int, default=30, help="Also include this many recent notes from /notes")
+    p_granola.add_argument("--sleep", type=float, default=0.22, help="Delay between API note fetches")
+    p_granola.add_argument("--force", action="store_true", help="Refetch notes already cached")
+    p_granola.add_argument("--index", action="store_true", help="Run jmem index after sync")
+    p_granola.add_argument("--verbose", action="store_true")
+    p_granola.set_defaults(func=sync_granola_notes)
 
     args = parser.parse_args()
     return args.func(args)
