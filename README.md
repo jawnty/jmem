@@ -11,6 +11,50 @@ The v0 principle is simple: **broad index, narrow injection**.
 - Store generated indexes, logs, and meeting-note caches outside git.
 - Inject source-labeled snippets, not a giant second-brain dump.
 
+## How jmem Works
+
+jmem keeps your real files where they are, builds a local search index, and
+injects only the most relevant snippets before each agent turn.
+
+```mermaid
+flowchart TB
+  docs[/"Project docs<br/>README, AGENTS<br/>PROGRESS, HEARTBEAT"/]
+  memory[/"Agent memory<br/>Codex, Claude<br/>local notes"/]
+  granola[/"Granola notes<br/>meetings, transcripts"/]
+
+  cache[("Local markdown cache<br/>gitignored")]
+  jmem{{jmem<br/>index + retrieve}}
+  index[("SQLite FTS index<br/>gitignored")]
+
+  user(["You type a prompt<br/>Codex or Claude Code"])
+  hook["UserPromptSubmit hook<br/>before each agent turn"]
+  packet[/"Memory packet<br/>small, relevant, source-labeled"/]
+  agent(["Agent response<br/>with ambient context"])
+
+  docs -- lazy scan --> jmem
+  memory -- lazy scan --> jmem
+  granola -- auto-poll hourly --> cache
+  cache --> jmem
+
+  jmem --> index
+  index --> hook
+  user --> hook
+  hook --> packet
+  packet --> agent
+
+  classDef core fill:#111827,color:#ffffff,stroke:#111827,stroke-width:3px;
+  classDef neutral fill:#f8fafc,stroke:#94a3b8,color:#0f172a;
+  classDef store fill:#ffffff,stroke:#64748b,color:#0f172a;
+
+  class jmem core;
+  class docs,memory,granola,user,hook,packet,agent neutral;
+  class cache,index store;
+```
+
+Local files are lazy scanned into the index when jmem runs or the index is
+stale. Granola can be auto-polled hourly into a gitignored local cache. Every
+prompt retrieves from the local index; it does not reread every source live.
+
 ## What v0 Does
 
 - Indexes project docs named `AGENTS.md`, `CLAUDE.md`, `README.md`,
