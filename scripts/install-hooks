@@ -41,11 +41,17 @@ def ensure_hook(config: dict, event: str, command: str) -> bool:
 def install_codex() -> bool:
     path = HOME / ".codex/hooks.json"
     data = load_json(path)
-    changed = ensure_hook(
+    changed_prompt = ensure_hook(
         data,
         "UserPromptSubmit",
         str(ROOT / "bin/jmem-codex-hook") + " user-prompt",
     )
+    changed_stop = ensure_hook(
+        data,
+        "Stop",
+        str(ROOT / "bin/jmem-codex-hook") + " stop",
+    )
+    changed = changed_prompt or changed_stop
     if changed:
         write_json(path, data)
     print(f"codex_hooks={path} changed={changed}")
@@ -55,11 +61,17 @@ def install_codex() -> bool:
 def install_claude() -> bool:
     path = HOME / ".claude/settings.json"
     data = load_json(path)
-    changed = ensure_hook(
+    changed_prompt = ensure_hook(
         data,
         "UserPromptSubmit",
         str(ROOT / "bin/jmem-claude-hook") + " user-prompt",
     )
+    changed_stop = ensure_hook(
+        data,
+        "Stop",
+        str(ROOT / "bin/jmem-claude-hook") + " stop",
+    )
+    changed = changed_prompt or changed_stop
     if changed:
         write_json(path, data)
     print(f"claude_settings={path} changed={changed}")
@@ -83,4 +95,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

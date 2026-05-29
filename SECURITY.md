@@ -7,13 +7,18 @@ Do not commit:
 - `index/`
 - `logs/`
 - `memory/granola/`
+- `memory/candidates/`
 - `.env`
-- API keys, access tokens, or generated meeting-note caches
+- API keys, access tokens, generated meeting-note caches, or generated memory
+  candidates
 
 The repository `.gitignore` excludes those paths by default.
 
 Granola notes and transcripts can contain sensitive personal, business, or client
 information. They are cached locally only so prompt hooks can stay fast.
+
+Memory candidates can contain private session details. They are review queues,
+not public documentation.
 
 Before publishing a fork, run:
 
@@ -22,4 +27,3 @@ git status --short
 git diff --cached --name-only
 rg -n "API_KEY|TOKEN|SECRET|Bearer|sk-|ghp_|gho_|AIza|@|/Users/" .
 ```
-

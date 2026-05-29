@@ -1,6 +1,7 @@
 index/
 logs/
 memory/granola/
+memory/candidates/
 .venv/
 .venv-test/
 *.egg-info/

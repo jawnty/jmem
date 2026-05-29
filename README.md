@@ -10,6 +10,7 @@ The v0 principle is simple: **broad index, narrow injection**.
 - Cache sensitive external sources locally only when needed for fast retrieval.
 - Store generated indexes, logs, and meeting-note caches outside git.
 - Inject source-labeled snippets, not a giant second-brain dump.
+- Make retrieval observable before making memory smarter.
 
 ## How jmem Works
 
@@ -75,6 +76,10 @@ Refresh behavior:
 - Caches and indexes Granola notes through the Granola API when
   `GRANOLA_API_KEY` is configured.
 - Injects context into Codex and Claude Code through local hooks.
+- Shows what happened with `jmem doctor`, `jmem trace`, and
+  `jmem context --explain`.
+- Writes reviewable memory candidates from `Stop` hooks without promoting them
+  into canonical memory automatically.
 - Uses SQLite FTS only. No cloud database, no embeddings, no external service.
 
 ## Install
@@ -130,6 +135,9 @@ jmem index
 jmem stats
 jmem search "morning brief heartbeat"
 jmem context --cwd "$PWD" --prompt "why did morning brief fail?"
+jmem context --cwd "$PWD" --prompt "why did morning brief fail?" --explain
+jmem doctor
+jmem trace --limit 5
 ```
 
 The context command prints what hooks inject into an agent turn:
@@ -147,7 +155,7 @@ Use this as local memory hints, not guaranteed truth...
 
 ## Codex Hook
 
-Install the Codex hook:
+Install the Codex hooks:
 
 ```bash
 ./scripts/install-hooks --codex
@@ -164,9 +172,18 @@ The hook command is:
 It reads Codex's hook JSON from stdin, runs `jmem context`, and returns
 `additionalContext`.
 
+The installer also adds a `Stop` hook:
+
+```bash
+~/projects/jmem/bin/jmem-codex-hook stop
+```
+
+Stop hooks write reviewable memory candidates under `memory/candidates/` when
+the hook event includes useful summary, prompt, response, or transcript text.
+
 ## Claude Code Hook
 
-Install the Claude Code hook:
+Install the Claude Code hooks:
 
 ```bash
 ./scripts/install-hooks --claude
@@ -182,6 +199,63 @@ The hook command is:
 
 Claude Code injects `UserPromptSubmit` hook stdout as context, so this hook
 prints the raw `jmem context` packet.
+
+The installer also adds a `Stop` hook:
+
+```bash
+~/projects/jmem/bin/jmem-claude-hook stop
+```
+
+Claude Code Stop hook events can include transcript paths. jmem reads those when
+available and writes reviewable memory candidates under `memory/candidates/`.
+
+## Observability
+
+Check whether jmem is healthy:
+
+```bash
+jmem doctor
+```
+
+Inspect recent hook activity:
+
+```bash
+jmem trace --limit 10
+jmem trace --limit 10 --json
+```
+
+Explain why a prompt retrieves particular snippets:
+
+```bash
+jmem context --cwd "$PWD" --prompt "what did we decide about Granola?" --explain
+```
+
+The hook log is stored in:
+
+```text
+logs/hooks.jsonl
+```
+
+That folder is gitignored.
+
+## Memory Candidates
+
+Stop hooks and manual commands write reviewable candidates:
+
+```bash
+jmem candidates add --cwd "$PWD" --text "Decision: keep writeback reviewable."
+jmem candidates list
+```
+
+Candidates are stored in:
+
+```text
+memory/candidates/
+```
+
+That folder is gitignored because candidates can contain private session
+details. jmem does not yet promote candidates into canonical memory. Review them
+before copying anything into a durable memory file.
 
 ## Granola
 
@@ -243,6 +317,7 @@ The repo ignores generated and sensitive state:
 index/
 logs/
 memory/granola/
+memory/candidates/
 ```
 
 Run a quick pre-publish scan:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import datetime as dt
 import hashlib
 import json
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from typing import Iterable
@@ -22,6 +24,7 @@ DEFAULT_ROOT = PACKAGE_PARENT if (PACKAGE_PARENT / "bin").exists() else HOME / "
 ROOT = Path(os.environ.get("JMEM_HOME", DEFAULT_ROOT)).expanduser()
 DB_PATH = ROOT / "index" / "jmem.sqlite"
 LOG_PATH = ROOT / "logs" / "hooks.jsonl"
+CANDIDATES_DIR = ROOT / "memory" / "candidates"
 PROJECTS_ROOT = Path(os.environ.get("JMEM_PROJECTS_ROOT", HOME / "projects")).expanduser()
 
 PROJECT_DOC_NAMES = {"AGENTS.md", "CLAUDE.md", "README.md", "PROGRESS.md", "HEARTBEAT.md"}
@@ -54,6 +57,17 @@ GRANOLA_CACHE_DIR = ROOT / "memory" / "granola"
 GRANOLA_STATE = Path(
     os.environ.get("JMEM_GRANOLA_STATE", HOME / ".claude/skills/granola-to-drive/state.json")
 ).expanduser()
+
+
+@dataclass
+class RetrievalTrace:
+    cwd: str
+    prompt: str
+    query_terms: list[str]
+    project_terms: list[str]
+    fts_query: str
+    candidates_seen: int
+    matches: list[tuple[float, sqlite3.Row]]
 
 
 def connect() -> sqlite3.Connection:
@@ -535,7 +549,7 @@ def snippet(content: str, query_terms: list[str], max_chars: int = 620) -> str:
     return out
 
 
-def retrieve(cwd: str, prompt: str, limit: int = 8) -> list[sqlite3.Row]:
+def retrieve_with_trace(cwd: str, prompt: str, limit: int = 8) -> RetrievalTrace:
     ensure_index()
     conn = connect()
     init_db(conn)
@@ -543,7 +557,7 @@ def retrieve(cwd: str, prompt: str, limit: int = 8) -> list[sqlite3.Row]:
     p_terms = project_terms(cwd)
     terms = list(dict.fromkeys(q_terms + p_terms))
     if not terms:
-        return []
+        return RetrievalTrace(cwd, prompt, q_terms, p_terms, "", 0, [])
 
     rows: list[sqlite3.Row] = []
     query = fts_query(terms)
@@ -600,8 +614,9 @@ def retrieve(cwd: str, prompt: str, limit: int = 8) -> list[sqlite3.Row]:
         score += max(0, 3.0 - min(age_days / 30.0, 3.0))
         scored.append((score, row))
 
+    candidates_seen = len(scored)
     scored.sort(key=lambda item: item[0], reverse=True)
-    unique: list[sqlite3.Row] = []
+    unique: list[tuple[float, sqlite3.Row]] = []
     seen_paths: set[str] = set()
     for score, row in scored:
         if score <= 0:
@@ -609,20 +624,24 @@ def retrieve(cwd: str, prompt: str, limit: int = 8) -> list[sqlite3.Row]:
         if row["path"] in seen_paths:
             continue
         seen_paths.add(row["path"])
-        unique.append(row)
+        unique.append((score, row))
         if len(unique) >= limit:
             break
-    return unique
+    return RetrievalTrace(cwd, prompt, q_terms, p_terms, query, candidates_seen, unique)
+
+
+def retrieve(cwd: str, prompt: str, limit: int = 8) -> list[sqlite3.Row]:
+    return [row for _, row in retrieve_with_trace(cwd, prompt, limit).matches]
 
 
 def build_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
     if prompt.strip().lower() in TRIVIAL_PROMPTS:
         return ""
-    rows = retrieve(cwd, prompt)
-    if not rows:
+    trace = retrieve_with_trace(cwd, prompt)
+    if not trace.matches:
         return ""
 
-    terms = list(dict.fromkeys(tokens(prompt) + project_terms(cwd)))
+    terms = list(dict.fromkeys(trace.query_terms + trace.project_terms))
     lines = [
         "# jmem Ambient Context",
         "",
@@ -630,7 +649,7 @@ def build_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
         "",
     ]
     used = 0
-    for row in rows:
+    for _, row in trace.matches:
         item = (
             f"## {row['title']}\n"
             f"- source: {row['source']}\n"
@@ -644,11 +663,45 @@ def build_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
     return "\n".join(lines).strip()
 
 
+def explain_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
+    trace = retrieve_with_trace(cwd, prompt)
+    rows = [row for _, row in trace.matches]
+    context = build_context(cwd, prompt, max_chars)
+    terms = list(dict.fromkeys(trace.query_terms + trace.project_terms))
+    lines = [
+        "# jmem Retrieval Explain",
+        "",
+        f"cwd: {cwd}",
+        f"query_terms: {', '.join(trace.query_terms) or '(none)'}",
+        f"project_terms: {', '.join(trace.project_terms) or '(none)'}",
+        f"fts_query: {trace.fts_query or '(none)'}",
+        f"candidates_seen: {trace.candidates_seen}",
+        f"selected: {len(rows)}",
+        "",
+    ]
+    for idx, (score, row) in enumerate(trace.matches, start=1):
+        lines.extend([
+            f"## {idx}. {row['title']}",
+            f"- score: {score:.2f}",
+            f"- source: {row['source']}",
+            f"- path: {row['path']}",
+            f"- chunk_index: {row['chunk_index']}",
+            f"- snippet: {snippet(row['content'], terms)}",
+            "",
+        ])
+    if context:
+        lines.extend(["# Context Packet", "", context])
+    return "\n".join(lines).strip()
+
+
 def cmd_context(args: argparse.Namespace) -> int:
     prompt = args.prompt
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read()
-    context = build_context(args.cwd, prompt or "", args.max_chars)
+    if args.explain:
+        context = explain_context(args.cwd, prompt or "", args.max_chars)
+    else:
+        context = build_context(args.cwd, prompt or "", args.max_chars)
     if context:
         print(context)
     return 0
@@ -683,8 +736,286 @@ def cmd_stats(_: argparse.Namespace) -> int:
     return 0
 
 
-def log_hook(event: dict, injected: str) -> None:
+def read_hook_logs(limit: int = 20) -> list[dict]:
+    if not LOG_PATH.exists():
+        return []
+    records: list[dict] = []
+    try:
+        lines = LOG_PATH.read_text(errors="ignore").splitlines()
+    except Exception:
+        return []
+    for line in lines[-max(limit * 3, limit):]:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records[-limit:]
+
+
+def hook_command(path: Path, mode: str) -> str:
+    return f"{path} {mode}"
+
+
+def config_has_command(path: Path, command: str) -> bool:
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return False
+    hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return False
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            for hook in entry.get("hooks", []):
+                if isinstance(hook, dict) and hook.get("command") == command:
+                    return True
+    return False
+
+
+def launchagent_loaded(label: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def cmd_doctor(_: argparse.Namespace) -> int:
+    conn = connect()
+    init_db(conn)
+    last = conn.execute("SELECT value FROM metadata WHERE key = 'last_indexed_at'").fetchone()
+    counts = conn.execute(
+        "SELECT COUNT(DISTINCT path) files, COUNT(*) chunks FROM chunks"
+    ).fetchone()
+    source_rows = conn.execute(
+        "SELECT source, COUNT(DISTINCT path) files FROM chunks GROUP BY source ORDER BY source"
+    ).fetchall()
+    codex_hook = hook_command(ROOT / "bin/jmem-codex-hook", "user-prompt")
+    codex_stop = hook_command(ROOT / "bin/jmem-codex-hook", "stop")
+    claude_hook = hook_command(ROOT / "bin/jmem-claude-hook", "user-prompt")
+    claude_stop = hook_command(ROOT / "bin/jmem-claude-hook", "stop")
+    logs = read_hook_logs(10)
+    injected = [r for r in logs if int(r.get("injected_chars") or 0) > 0]
+    candidates = sorted(CANDIDATES_DIR.glob("*.md")) if CANDIDATES_DIR.exists() else []
+
+    print("jmem doctor")
+    print(f"root={ROOT}")
+    print(f"db={DB_PATH} exists={DB_PATH.exists()}")
+    print(f"last_indexed_at={last['value'] if last else 'unknown'}")
+    print(f"files={counts['files']} chunks={counts['chunks']}")
+    print("sources=" + ", ".join(f"{r['source']}:{r['files']}" for r in source_rows))
+    print(f"codex_user_prompt_hook={config_has_command(HOME / '.codex/hooks.json', codex_hook)}")
+    print(f"codex_stop_hook={config_has_command(HOME / '.codex/hooks.json', codex_stop)}")
+    print(f"claude_user_prompt_hook={config_has_command(HOME / '.claude/settings.json', claude_hook)}")
+    print(f"claude_stop_hook={config_has_command(HOME / '.claude/settings.json', claude_stop)}")
+    print(f"granola_token_configured={granola_api_token() is not None}")
+    print(f"granola_cache_files={len(list(GRANOLA_CACHE_DIR.glob('*.md'))) if GRANOLA_CACHE_DIR.exists() else 0}")
+    print(f"granola_launchagent_file={(HOME / 'Library/LaunchAgents/com.jmem.granola-sync.plist').exists()}")
+    print(f"granola_launchagent_loaded={launchagent_loaded('com.jmem.granola-sync')}")
+    print(f"hook_log={LOG_PATH} exists={LOG_PATH.exists()}")
+    print(f"recent_hook_events={len(logs)} recent_injections={len(injected)}")
+    print(f"candidate_files={len(candidates)}")
+    if logs:
+        print("recent_hooks:")
+        for record in logs[-5:]:
+            print(
+                "- "
+                f"ts={record.get('ts')} "
+                f"event={record.get('event')} "
+                f"cwd={record.get('cwd')} "
+                f"injected_chars={record.get('injected_chars')} "
+                f"sources={','.join(record.get('top_sources') or [])}"
+            )
+    return 0
+
+
+def cmd_trace(args: argparse.Namespace) -> int:
+    records = read_hook_logs(args.limit)
+    if args.json:
+        print(json.dumps(records, indent=2))
+        return 0
+    for record in records:
+        print(f"{record.get('ts')} | {record.get('event')} | injected={record.get('injected_chars')}")
+        print(f"cwd: {record.get('cwd')}")
+        print(f"prompt: {record.get('prompt_prefix')}")
+        sources = record.get("top_sources") or []
+        paths = record.get("top_paths") or []
+        print(f"sources: {', '.join(sources) or '(none)'}")
+        for path in paths[: args.paths]:
+            print(f"- {path}")
+        if record.get("candidate_path"):
+            print(f"candidate: {record.get('candidate_path')}")
+        print()
+    return 0
+
+
+def slugify(text: str, fallback: str = "session") -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", text.lower()).strip("-")
+    return (slug[:60].strip("-") or fallback)
+
+
+def read_transcript_text(path: str, max_chars: int = 40_000) -> str:
+    if not path:
+        return ""
+    transcript = Path(path).expanduser()
+    if not transcript.exists() or transcript.stat().st_size > 20_000_000:
+        return ""
+    chunks: list[str] = []
+    try:
+        for line in transcript.read_text(errors="ignore").splitlines()[-800:]:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                if line.strip():
+                    chunks.append(line.strip())
+                continue
+            text = ""
+            if isinstance(item, dict):
+                for key in ("text", "content", "message", "prompt", "response"):
+                    value = item.get(key)
+                    if isinstance(value, str):
+                        text = value
+                        break
+                if not text and isinstance(item.get("message"), dict):
+                    value = item["message"].get("content")
+                    if isinstance(value, str):
+                        text = value
+                    elif isinstance(value, list):
+                        text = " ".join(
+                            part.get("text", "")
+                            for part in value
+                            if isinstance(part, dict) and isinstance(part.get("text"), str)
+                        )
+            if text.strip():
+                chunks.append(text.strip())
+    except Exception:
+        return ""
+    joined = "\n".join(chunks)
+    return joined[-max_chars:]
+
+
+def extract_candidate_lines(text: str, limit: int = 12) -> list[str]:
+    candidates: list[str] = []
+    patterns = re.compile(
+        r"\b(remember|preference|prefers|decision|decided|next|follow[- ]?up|todo|should|always|never|important|critical)\b",
+        re.IGNORECASE,
+    )
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw).strip(" -\t")
+        if len(line) < 12 or len(line) > 260:
+            continue
+        if patterns.search(line):
+            candidates.append(line)
+        if len(candidates) >= limit:
+            break
+    if not candidates:
+        compact = re.sub(r"\s+", " ", text).strip()
+        if compact:
+            candidates.append(compact[:240])
+    return list(dict.fromkeys(candidates))[:limit]
+
+
+def write_candidate(
+    text: str,
+    cwd: str,
+    source: str = "manual",
+    session_id: str = "",
+    transcript_path: str = "",
+) -> Path | None:
+    lines = extract_candidate_lines(text)
+    if not lines:
+        return None
+    CANDIDATES_DIR.mkdir(parents=True, exist_ok=True)
+    now = dt.datetime.now().astimezone()
+    slug_source = session_id or Path(cwd).name or source
+    path = CANDIDATES_DIR / f"{now.strftime('%Y%m%d-%H%M%S')}-{slugify(slug_source)}.md"
+    body = [
+        "---",
+        "status: candidate",
+        f"created_at: {now.isoformat(timespec='seconds')}",
+        f"source: {source}",
+        f"cwd: {cwd}",
+        f"session_id: {session_id}",
+        f"transcript_path: {transcript_path}",
+        "---",
+        "",
+        "# Memory Candidate",
+        "",
+        "Review these before promoting anything into canonical memory.",
+        "",
+        "## Candidate memories",
+        "",
+    ]
+    body.extend(f"- [ ] {line}" for line in lines)
+    body.extend([
+        "",
+        "## Source excerpt",
+        "",
+        "```text",
+        text.strip()[:4000],
+        "```",
+        "",
+    ])
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(body), encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def candidate_text_from_event(event: dict) -> tuple[str, str]:
+    transcript_path = str(event.get("transcript_path") or event.get("transcriptPath") or "")
+    pieces = []
+    for key in ("summary", "prompt", "user_prompt", "message", "response"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            pieces.append(value.strip())
+    transcript_text = read_transcript_text(transcript_path)
+    if transcript_text:
+        pieces.append(transcript_text)
+    return "\n\n".join(pieces), transcript_path
+
+
+def cmd_candidates_add(args: argparse.Namespace) -> int:
+    text = args.text
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read()
+    path = write_candidate(
+        text or "",
+        args.cwd,
+        source=args.source,
+        session_id=args.session_id,
+        transcript_path=args.transcript_path,
+    )
+    if not path:
+        print("no candidate written")
+        return 1
+    print(path)
+    return 0
+
+
+def cmd_candidates_list(args: argparse.Namespace) -> int:
+    if not CANDIDATES_DIR.exists():
+        return 0
+    paths = sorted(CANDIDATES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in paths[: args.limit]:
+        print(path)
+    return 0
+
+
+def log_hook(event: dict, injected: str, trace: RetrievalTrace | None = None, candidate_path: str = "") -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    top_rows = [row for _, row in trace.matches] if trace else []
+    top_sources = list(dict.fromkeys(str(row["source"]) for row in top_rows))
+    top_paths = [str(row["path"]) for row in top_rows[:5]]
     record = {
         "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "event": event.get("hook_event_name"),
@@ -693,6 +1024,10 @@ def log_hook(event: dict, injected: str) -> None:
         "cwd": event.get("cwd"),
         "prompt_prefix": (event.get("prompt") or "")[:160],
         "injected_chars": len(injected),
+        "top_sources": top_sources,
+        "top_paths": top_paths,
+        "granola_used": any(source == "granola_api" for source in top_sources),
+        "candidate_path": candidate_path,
     }
     with LOG_PATH.open("a") as fh:
         fh.write(json.dumps(record, ensure_ascii=True) + "\n")
@@ -705,13 +1040,28 @@ def hook_main(argv: list[str]) -> int:
     except json.JSONDecodeError:
         event = {}
 
+    if mode == "stop" or event.get("hook_event_name") == "Stop":
+        event.setdefault("hook_event_name", "Stop")
+        event.setdefault("cwd", event.get("cwd") or os.getcwd())
+        text, transcript_path = candidate_text_from_event(event)
+        candidate = write_candidate(
+            text,
+            event.get("cwd") or os.getcwd(),
+            source="codex_stop_hook",
+            session_id=str(event.get("session_id") or ""),
+            transcript_path=transcript_path,
+        )
+        log_hook(event, "", None, str(candidate) if candidate else "")
+        return 0
+
     if mode != "user-prompt" and event.get("hook_event_name") != "UserPromptSubmit":
         return 0
 
     prompt = event.get("prompt") or ""
     cwd = event.get("cwd") or os.getcwd()
+    trace = retrieve_with_trace(cwd, prompt) if prompt.strip().lower() not in TRIVIAL_PROMPTS else None
     context = build_context(cwd, prompt)
-    log_hook(event, context)
+    log_hook(event, context, trace)
     if not context:
         return 0
     print(json.dumps({
@@ -735,6 +1085,20 @@ def claude_hook_main(argv: list[str]) -> int:
         event = {}
 
     hook_event = event.get("hook_event_name") or event.get("hookEventName")
+    if mode == "stop" or hook_event == "Stop":
+        event.setdefault("hook_event_name", "Stop")
+        event.setdefault("cwd", event.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+        text, transcript_path = candidate_text_from_event(event)
+        candidate = write_candidate(
+            text,
+            event.get("cwd") or os.getcwd(),
+            source="claude_stop_hook",
+            session_id=str(event.get("session_id") or ""),
+            transcript_path=transcript_path,
+        )
+        log_hook(event, "", None, str(candidate) if candidate else "")
+        return 0
+
     if mode != "user-prompt" and hook_event != "UserPromptSubmit":
         return 0
 
@@ -746,11 +1110,12 @@ def claude_hook_main(argv: list[str]) -> int:
         or ""
     )
     cwd = event.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    trace = retrieve_with_trace(cwd, prompt) if prompt.strip().lower() not in TRIVIAL_PROMPTS else None
     context = build_context(cwd, prompt)
     event.setdefault("hook_event_name", hook_event or "UserPromptSubmit")
     event.setdefault("prompt", prompt)
     event.setdefault("cwd", cwd)
-    log_hook(event, context)
+    log_hook(event, context, trace)
     if context:
         print(context)
     return 0
@@ -780,7 +1145,32 @@ def main() -> int:
     p_context.add_argument("--cwd", default=os.getcwd())
     p_context.add_argument("--prompt", default="")
     p_context.add_argument("--max-chars", type=int, default=6000)
+    p_context.add_argument("--explain", action="store_true", help="Show retrieval terms, selected matches, and context")
     p_context.set_defaults(func=cmd_context)
+
+    p_doctor = sub.add_parser("doctor", help="Check jmem hook, index, Granola, and log health")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_trace = sub.add_parser("trace", help="Show recent hook retrieval activity")
+    p_trace.add_argument("--limit", type=int, default=10)
+    p_trace.add_argument("--paths", type=int, default=3, help="Number of matched paths to show per hook event")
+    p_trace.add_argument("--json", action="store_true", help="Emit raw hook log records as JSON")
+    p_trace.set_defaults(func=cmd_trace)
+
+    p_candidates = sub.add_parser("candidates", help="Create or list reviewable memory candidates")
+    candidates_sub = p_candidates.add_subparsers(dest="candidate_cmd", required=True)
+
+    p_candidates_add = candidates_sub.add_parser("add", help="Write a reviewable memory candidate from text")
+    p_candidates_add.add_argument("--cwd", default=os.getcwd())
+    p_candidates_add.add_argument("--source", default="manual")
+    p_candidates_add.add_argument("--session-id", default="")
+    p_candidates_add.add_argument("--transcript-path", default="")
+    p_candidates_add.add_argument("--text", default="")
+    p_candidates_add.set_defaults(func=cmd_candidates_add)
+
+    p_candidates_list = candidates_sub.add_parser("list", help="List recent memory candidates")
+    p_candidates_list.add_argument("--limit", type=int, default=10)
+    p_candidates_list.set_defaults(func=cmd_candidates_list)
 
     p_granola = sub.add_parser("granola-sync", help="Fetch Granola notes into the local jmem cache")
     p_granola.add_argument("--limit", type=int, default=0, help="Limit note fetch count for testing")
