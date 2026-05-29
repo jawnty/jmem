@@ -18,22 +18,22 @@ injects only the most relevant snippets before each agent turn.
 
 ```mermaid
 flowchart TB
-  docs[/"Project docs<br/>README, AGENTS<br/>PROGRESS, HEARTBEAT"/]
-  memory[/"Agent memory<br/>Codex, Claude<br/>local notes"/]
-  granola[/"Granola notes<br/>meetings, transcripts"/]
+  docs["Project docs<br/>README, AGENTS<br/>PROGRESS, HEARTBEAT"]
+  memory["Agent memory<br/>Codex, Claude<br/>local notes"]
+  granola["Granola notes<br/>meetings, transcripts"]
 
   cache[("Local markdown cache<br/>gitignored")]
-  jmem{{jmem<br/>index + retrieve}}
+  jmem["jmem<br/>index + retrieve"]
   index[("SQLite FTS index<br/>gitignored")]
 
-  user(["You type a prompt<br/>Codex or Claude Code"])
+  user["You type a prompt<br/>Codex or Claude Code"]
   hook["UserPromptSubmit hook<br/>before each agent turn"]
-  packet[/"Memory packet<br/>small, relevant, source-labeled"/]
-  agent(["Agent response<br/>with ambient context"])
+  packet["Memory packet<br/>small, relevant, source-labeled"]
+  agent["Agent response<br/>with ambient context"]
 
-  docs -- lazy scan --> jmem
-  memory -- lazy scan --> jmem
-  granola -- auto-poll hourly --> cache
+  docs --> jmem
+  memory --> jmem
+  granola --> cache
   cache --> jmem
 
   jmem --> index
@@ -42,18 +42,25 @@ flowchart TB
   hook --> packet
   packet --> agent
 
-  classDef core fill:#111827,color:#ffffff,stroke:#111827,stroke-width:3px;
-  classDef neutral fill:#f8fafc,stroke:#94a3b8,color:#0f172a;
-  classDef store fill:#ffffff,stroke:#64748b,color:#0f172a;
+  classDef source fill:#f8fafc,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  classDef core fill:#e0f2fe,stroke:#0284c7,stroke-width:3px,color:#082f49;
+  classDef store fill:#fff7ed,stroke:#fdba74,stroke-width:2px,color:#431407;
+  classDef runtime fill:#f8fafc,stroke:#94a3b8,stroke-width:1px,color:#0f172a;
 
   class jmem core;
-  class docs,memory,granola,user,hook,packet,agent neutral;
+  class docs,memory,granola source;
   class cache,index store;
+  class user,hook,packet,agent runtime;
 ```
 
-Local files are lazy scanned into the index when jmem runs or the index is
-stale. Granola can be auto-polled hourly into a gitignored local cache. Every
-prompt retrieves from the local index; it does not reread every source live.
+Refresh behavior:
+
+- **Lazy scan:** project docs and agent memory are scanned when jmem runs, or
+  when the index is stale.
+- **Auto-poll:** Granola can sync hourly into the gitignored local cache when
+  the optional launchd sync is installed.
+- **Per turn:** each prompt retrieves from the local index; jmem does not
+  reread every source live.
 
 ## What v0 Does
 
