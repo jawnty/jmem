@@ -2,6 +2,7 @@ index/
 logs/
 memory/granola/
 memory/candidates/
+memory/canon/
 .venv/
 .venv-test/
 *.egg-info/

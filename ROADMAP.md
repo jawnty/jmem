@@ -10,17 +10,18 @@
 - Health and retrieval observability with `jmem doctor`, `jmem trace`, and
   `jmem context --explain`.
 - Reviewable writeback candidates from `Stop` hooks and `jmem candidates add`.
-
-## Next
-
-- Add candidate review and promotion commands:
+- Candidate review commands:
   - `jmem candidates show`
   - `jmem candidates accept`
   - `jmem candidates reject`
-- Add a curated extracted-memory layer:
-  - `memory/canon/`
+  - `jmem candidates prune`
+
+## Next
+
+- Improve the curated extracted-memory layer:
   - `memory/people/`
   - `memory/projects/`
+  - candidate-to-bucket suggestions
 - Add source-level privacy scopes and retrieval budgets.
 - Add tombstones for deleted/404 Granola notes.
 - Add optional embeddings after FTS misses are observed.

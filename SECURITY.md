@@ -8,9 +8,10 @@ Do not commit:
 - `logs/`
 - `memory/granola/`
 - `memory/candidates/`
+- `memory/canon/`
 - `.env`
 - API keys, access tokens, generated meeting-note caches, or generated memory
-  candidates
+  files
 
 The repository `.gitignore` excludes those paths by default.
 
@@ -19,6 +20,9 @@ information. They are cached locally only so prompt hooks can stay fast.
 
 Memory candidates can contain private session details. They are review queues,
 not public documentation.
+
+Canon memory files are also private local state. They may contain durable user
+preferences, project decisions, people notes, or operational details.
 
 Before publishing a fork, run:
 

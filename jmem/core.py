@@ -25,6 +25,7 @@ ROOT = Path(os.environ.get("JMEM_HOME", DEFAULT_ROOT)).expanduser()
 DB_PATH = ROOT / "index" / "jmem.sqlite"
 LOG_PATH = ROOT / "logs" / "hooks.jsonl"
 CANDIDATES_DIR = ROOT / "memory" / "candidates"
+CANON_DIR = ROOT / "memory" / "canon"
 PROJECTS_ROOT = Path(os.environ.get("JMEM_PROJECTS_ROOT", HOME / "projects")).expanduser()
 
 PROJECT_DOC_NAMES = {"AGENTS.md", "CLAUDE.md", "README.md", "PROGRESS.md", "HEARTBEAT.md"}
@@ -805,7 +806,8 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     claude_stop = hook_command(ROOT / "bin/jmem-claude-hook", "stop")
     logs = read_hook_logs(10)
     injected = [r for r in logs if int(r.get("injected_chars") or 0) > 0]
-    candidates = sorted(CANDIDATES_DIR.glob("*.md")) if CANDIDATES_DIR.exists() else []
+    candidates = candidate_paths()
+    canon_files = sorted(CANON_DIR.glob("*.md")) if CANON_DIR.exists() else []
 
     print("jmem doctor")
     print(f"root={ROOT}")
@@ -824,6 +826,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"hook_log={LOG_PATH} exists={LOG_PATH.exists()}")
     print(f"recent_hook_events={len(logs)} recent_injections={len(injected)}")
     print(f"candidate_files={len(candidates)}")
+    print(f"canon_files={len(canon_files)}")
     if logs:
         print("recent_hooks:")
         for record in logs[-5:]:
@@ -971,6 +974,107 @@ def write_candidate(
     return path
 
 
+def candidate_paths(include_reviewed: bool = False) -> list[Path]:
+    if not CANDIDATES_DIR.exists():
+        return []
+    paths = sorted(CANDIDATES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if include_reviewed:
+        for child in ("accepted", "rejected"):
+            folder = CANDIDATES_DIR / child
+            if folder.exists():
+                paths.extend(sorted(folder.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True))
+    return paths
+
+
+def resolve_candidate(identifier: str = "") -> Path | None:
+    paths = candidate_paths(include_reviewed=False)
+    if not paths:
+        return None
+    if not identifier:
+        return paths[0]
+    possible = Path(identifier).expanduser()
+    if possible.exists():
+        return possible
+    if identifier.isdigit():
+        index = int(identifier) - 1
+        if 0 <= index < len(paths):
+            return paths[index]
+    for path in paths:
+        if path.stem == identifier or path.name == identifier or path.stem.startswith(identifier):
+            return path
+    return None
+
+
+def candidate_memory_lines(path: Path) -> list[str]:
+    try:
+        text = path.read_text(errors="ignore")
+    except Exception:
+        return []
+    lines: list[str] = []
+    in_section = False
+    for raw in text.splitlines():
+        if raw.strip() == "## Candidate memories":
+            in_section = True
+            continue
+        if in_section and raw.startswith("## "):
+            break
+        if not in_section:
+            continue
+        match = re.match(r"^-\s+\[[ xX]\]\s+(.+)$", raw.strip())
+        if match:
+            lines.append(match.group(1).strip())
+    return lines
+
+
+def update_candidate_status(path: Path, status: str, extra: list[str] | None = None) -> None:
+    now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        text = path.read_text(errors="ignore")
+    except Exception:
+        text = ""
+    text = re.sub(r"^status:\s+.*$", f"status: {status}", text, count=1, flags=re.MULTILINE)
+    if extra is None:
+        extra = []
+    note = ["", f"## Review", "", f"- status: {status}", f"- reviewed_at: {now}"]
+    note.extend(extra)
+    path.write_text(text.rstrip() + "\n" + "\n".join(note) + "\n", encoding="utf-8")
+
+
+def move_candidate(path: Path, folder_name: str) -> Path:
+    target_dir = CANDIDATES_DIR / folder_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / path.name
+    if target.exists():
+        target = target_dir / f"{path.stem}-{int(time.time())}{path.suffix}"
+    path.replace(target)
+    return target
+
+
+def append_canon(bucket: str, lines: list[str], source_path: Path) -> Path:
+    safe_bucket = slugify(bucket, "general")
+    CANON_DIR.mkdir(parents=True, exist_ok=True)
+    path = CANON_DIR / f"{safe_bucket}.md"
+    now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    existing = path.read_text(errors="ignore") if path.exists() else ""
+    body: list[str] = []
+    if not existing.strip():
+        title = safe_bucket.replace("-", " ").title()
+        body.extend([f"# {title}", ""])
+    body.extend([
+        f"## Accepted {now}",
+        "",
+        f"source_candidate: {source_path}",
+        "",
+    ])
+    body.extend(f"- {line}" for line in lines)
+    body.append("")
+    with path.open("a", encoding="utf-8") as fh:
+        if existing and not existing.endswith("\n"):
+            fh.write("\n")
+        fh.write("\n".join(body))
+    return path
+
+
 def candidate_text_from_event(event: dict) -> tuple[str, str]:
     transcript_path = str(event.get("transcript_path") or event.get("transcriptPath") or "")
     pieces = []
@@ -1003,11 +1107,76 @@ def cmd_candidates_add(args: argparse.Namespace) -> int:
 
 
 def cmd_candidates_list(args: argparse.Namespace) -> int:
-    if not CANDIDATES_DIR.exists():
-        return 0
-    paths = sorted(CANDIDATES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    paths = candidate_paths(include_reviewed=args.all)
     for path in paths[: args.limit]:
-        print(path)
+        rel = path.relative_to(CANDIDATES_DIR) if path.is_relative_to(CANDIDATES_DIR) else path
+        print(f"{paths.index(path) + 1}. {path.stem} | {rel}")
+    return 0
+
+
+def cmd_candidates_show(args: argparse.Namespace) -> int:
+    path = resolve_candidate(args.identifier)
+    if not path:
+        print("candidate not found", file=sys.stderr)
+        return 1
+    print(path)
+    print()
+    print(path.read_text(errors="ignore").rstrip())
+    return 0
+
+
+def cmd_candidates_accept(args: argparse.Namespace) -> int:
+    path = resolve_candidate(args.identifier)
+    if not path:
+        print("candidate not found", file=sys.stderr)
+        return 1
+    lines = candidate_memory_lines(path)
+    if args.line:
+        selected: list[str] = []
+        for idx in args.line:
+            if idx < 1 or idx > len(lines):
+                print(f"line index out of range: {idx}", file=sys.stderr)
+                return 1
+            selected.append(lines[idx - 1])
+        lines = selected
+    if not lines:
+        print("candidate has no memory lines", file=sys.stderr)
+        return 1
+    moved = move_candidate(path, "accepted")
+    canon_path = append_canon(args.bucket, lines, moved)
+    update_candidate_status(moved, "accepted", [f"- canon_path: {canon_path}", f"- accepted_lines: {len(lines)}"])
+    print(f"accepted={moved}")
+    print(f"canon={canon_path}")
+    return 0
+
+
+def cmd_candidates_reject(args: argparse.Namespace) -> int:
+    path = resolve_candidate(args.identifier)
+    if not path:
+        print("candidate not found", file=sys.stderr)
+        return 1
+    extra = [f"- reason: {args.reason}"] if args.reason else []
+    update_candidate_status(path, "rejected", extra)
+    moved = move_candidate(path, "rejected")
+    print(f"rejected={moved}")
+    return 0
+
+
+def cmd_candidates_prune(args: argparse.Namespace) -> int:
+    cutoff = time.time() - (args.days * 86400)
+    pruned = 0
+    for path in candidate_paths(include_reviewed=False):
+        if path.stat().st_mtime >= cutoff:
+            continue
+        if args.dry_run:
+            print(path)
+            continue
+        update_candidate_status(path, "pruned", [f"- reason: older than {args.days} days"])
+        moved = move_candidate(path, "rejected")
+        print(f"pruned={moved}")
+        pruned += 1
+    if not args.dry_run:
+        print(f"pruned_count={pruned}")
     return 0
 
 
@@ -1170,7 +1339,28 @@ def main() -> int:
 
     p_candidates_list = candidates_sub.add_parser("list", help="List recent memory candidates")
     p_candidates_list.add_argument("--limit", type=int, default=10)
+    p_candidates_list.add_argument("--all", action="store_true", help="Include accepted and rejected candidates")
     p_candidates_list.set_defaults(func=cmd_candidates_list)
+
+    p_candidates_show = candidates_sub.add_parser("show", help="Show a candidate by id, path, prefix, or newest")
+    p_candidates_show.add_argument("identifier", nargs="?", default="")
+    p_candidates_show.set_defaults(func=cmd_candidates_show)
+
+    p_candidates_accept = candidates_sub.add_parser("accept", help="Promote candidate lines into memory/canon")
+    p_candidates_accept.add_argument("identifier", nargs="?", default="")
+    p_candidates_accept.add_argument("--bucket", default="general", help="Canon bucket filename under memory/canon")
+    p_candidates_accept.add_argument("--line", type=int, action="append", help="Accept only this 1-based candidate line; repeatable")
+    p_candidates_accept.set_defaults(func=cmd_candidates_accept)
+
+    p_candidates_reject = candidates_sub.add_parser("reject", help="Move a candidate to rejected")
+    p_candidates_reject.add_argument("identifier", nargs="?", default="")
+    p_candidates_reject.add_argument("--reason", default="")
+    p_candidates_reject.set_defaults(func=cmd_candidates_reject)
+
+    p_candidates_prune = candidates_sub.add_parser("prune", help="Reject old unreviewed candidates")
+    p_candidates_prune.add_argument("--days", type=int, default=30)
+    p_candidates_prune.add_argument("--dry-run", action="store_true")
+    p_candidates_prune.set_defaults(func=cmd_candidates_prune)
 
     p_granola = sub.add_parser("granola-sync", help="Fetch Granola notes into the local jmem cache")
     p_granola.add_argument("--limit", type=int, default=0, help="Limit note fetch count for testing")

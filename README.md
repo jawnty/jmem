@@ -245,6 +245,10 @@ Stop hooks and manual commands write reviewable candidates:
 ```bash
 jmem candidates add --cwd "$PWD" --text "Decision: keep writeback reviewable."
 jmem candidates list
+jmem candidates show
+jmem candidates accept 1 --bucket preferences
+jmem candidates reject 1 --reason "not durable"
+jmem candidates prune --days 30 --dry-run
 ```
 
 Candidates are stored in:
@@ -254,8 +258,17 @@ memory/candidates/
 ```
 
 That folder is gitignored because candidates can contain private session
-details. jmem does not yet promote candidates into canonical memory. Review them
-before copying anything into a durable memory file.
+details.
+
+Accepted candidates append selected memory lines into:
+
+```text
+memory/canon/<bucket>.md
+```
+
+That folder is also gitignored. Canon files are still local, human-reviewed
+memory, not public documentation. Rejected and accepted source candidates are
+moved under `memory/candidates/rejected/` and `memory/candidates/accepted/`.
 
 ## Granola
 
@@ -318,6 +331,7 @@ index/
 logs/
 memory/granola/
 memory/candidates/
+memory/canon/
 ```
 
 Run a quick pre-publish scan:
