@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import datetime as dt
 import hashlib
 import json
@@ -28,7 +28,15 @@ CANDIDATES_DIR = ROOT / "memory" / "candidates"
 CANON_DIR = ROOT / "memory" / "canon"
 PROJECTS_ROOT = Path(os.environ.get("JMEM_PROJECTS_ROOT", HOME / "projects")).expanduser()
 
-PROJECT_DOC_NAMES = {"AGENTS.md", "CLAUDE.md", "README.md", "PROGRESS.md", "HEARTBEAT.md"}
+PROJECT_DOC_NAMES = {
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    "PROGRESS.md",
+    "HEARTBEAT.md",
+    "USER.md",
+    "MEMORY.md",
+}
 SKIP_DIRS = {
     ".git",
     ".next",
@@ -52,6 +60,10 @@ TRIVIAL_PROMPTS = {
     "ok", "okay", "yes", "no", "thanks", "thank you", "cool", "great", "done",
     "go ahead", "continue",
 }
+PROFILE_TERMS = {
+    "background", "profile", "john", "career", "experience", "style", "preferences",
+    "cares", "goals", "vp", "google", "uber", "youtube", "cisco",
+}
 INDEX_MAX_AGE_SECONDS = 60 * 60
 GRANOLA_API_BASE = "https://public-api.granola.ai/v1"
 GRANOLA_CACHE_DIR = ROOT / "memory" / "granola"
@@ -69,6 +81,7 @@ class RetrievalTrace:
     fts_query: str
     candidates_seen: int
     matches: list[tuple[float, sqlite3.Row]]
+    memory_matches: list[tuple[float, sqlite3.Row]] = field(default_factory=list)
 
 
 def connect() -> sqlite3.Connection:
@@ -99,6 +112,42 @@ def init_db(conn: sqlite3.Connection) -> None:
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS memory_items (
+          id INTEGER PRIMARY KEY,
+          text TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          status TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          evidence_count INTEGER NOT NULL,
+          source_hash TEXT NOT NULL UNIQUE,
+          updated_at TEXT NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts
+        USING fts5(text, kind, scope, content='memory_items', content_rowid='id');
+        CREATE TABLE IF NOT EXISTS memory_evidence (
+          id INTEGER PRIMARY KEY,
+          memory_id INTEGER NOT NULL,
+          source_type TEXT NOT NULL,
+          source_path TEXT NOT NULL,
+          source_excerpt TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(memory_id) REFERENCES memory_items(id)
+        );
+        CREATE TABLE IF NOT EXISTS memory_events (
+          id INTEGER PRIMARY KEY,
+          memory_id INTEGER NOT NULL,
+          event_type TEXT NOT NULL,
+          note TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(memory_id) REFERENCES memory_items(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_items_scope_status
+          ON memory_items(scope, status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_memory_items_kind
+          ON memory_items(kind);
         """
     )
 
@@ -132,6 +181,7 @@ def iter_memory_files() -> Iterable[tuple[str, Path]]:
         (HOME / ".codex/automations", "codex_automation_memory"),
         (HOME / ".clawmail/memory/notes", "clawmail_note"),
         (HOME / ".openclaw/memory/notes", "openclaw_note"),
+        (CANON_DIR, "jmem_memory"),
     ]:
         if not pattern.exists():
             continue
@@ -550,6 +600,280 @@ def snippet(content: str, query_terms: list[str], max_chars: int = 620) -> str:
     return out
 
 
+def now_utc() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def get_metadata(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+    return str(row["value"]) if row else None
+
+
+def set_metadata(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)", (key, value))
+
+
+def normalize_memory_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip(" -\t")
+    text = re.sub(r"^\[[ xX]\]\s*", "", text)
+    return text[:500]
+
+
+def memory_hash(kind: str, scope: str, text: str) -> str:
+    normalized = normalize_memory_text(text).lower()
+    return hashlib.sha256(f"{kind}\n{scope}\n{normalized}".encode("utf-8")).hexdigest()
+
+
+def scope_for_cwd(cwd: str) -> str:
+    try:
+        rel = Path(cwd).expanduser().resolve().relative_to(PROJECTS_ROOT)
+    except Exception:
+        return "global"
+    if not rel.parts:
+        return "global"
+    return f"project:{rel.parts[0]}"
+
+
+def parse_candidate_frontmatter(path: Path) -> dict[str, str]:
+    try:
+        text = path.read_text(errors="ignore")
+    except Exception:
+        return {}
+    if not text.startswith("---"):
+        return {}
+    match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+    if not match:
+        return {}
+    out: dict[str, str] = {}
+    for raw in match.group(1).splitlines():
+        if ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def classify_memory(text: str) -> tuple[str, float]:
+    line = normalize_memory_text(text)
+    lower = line.lower()
+    if not line or line.endswith("?"):
+        return "skip", 0.0
+    if lower.startswith("#") or lower.startswith("##"):
+        return "skip", 0.0
+    if re.match(r"^(what|why|how|when|where|can i|could i|should i|do i)\b", lower):
+        return "skip", 0.0
+    if re.match(r"^(i('|’)m|i am|let me|first, let me|you('|’)re right|this is important)\b", lower):
+        return "skip", 0.0
+    if re.search(r"\b(let me (check|see|inspect|investigate|fix)|i('|’)ll|i will)\b", lower):
+        return "skip", 0.0
+    if re.search(r"\b(correction|actually|instead of|not .* but|wrong|mistake)\b", lower):
+        return "correction", 0.86
+    if re.search(r"\b(preference|prefers|i prefer|john prefers|always|never|do not|don't|doesn't want|wants)\b", lower):
+        return "preference", 0.86
+    if re.search(r"\b(decision|decided|we chose|we are going to|go ahead|approved|ship|commit and push)\b", lower):
+        return "decision", 0.82
+    if re.search(r"\b(critical|important|must|non-negotiable|source of truth|first-class)\b", lower):
+        return "project_fact", 0.80
+    if re.search(r"\b(jmem|codex|claude code|granola|hook|userpromptsubmit|sqlite|launchagent|mcp)\b", lower):
+        return "project_fact", 0.74
+    if re.search(r"\b(todo|next|follow[- ]?up|should|need to|needs to)\b", lower):
+        return "todo", 0.64
+    return "general", 0.50
+
+
+def active_candidate_paths(limit: int = 0) -> list[Path]:
+    paths: list[Path] = []
+    for path in candidate_paths(include_reviewed=False):
+        meta = parse_candidate_frontmatter(path)
+        if meta.get("status", "candidate") != "candidate":
+            continue
+        paths.append(path)
+        if limit and len(paths) >= limit:
+            break
+    return paths
+
+
+def upsert_memory_item(
+    conn: sqlite3.Connection,
+    *,
+    text: str,
+    kind: str,
+    scope: str,
+    status: str,
+    confidence: float,
+    source_type: str,
+    source_path: str,
+) -> tuple[str, int | None]:
+    normalized = normalize_memory_text(text)
+    if not normalized:
+        return "skipped", None
+    now = now_utc()
+    source_hash = memory_hash(kind, scope, normalized)
+    existing = conn.execute(
+        "SELECT * FROM memory_items WHERE source_hash = ?",
+        (source_hash,),
+    ).fetchone()
+    if existing:
+        memory_id = int(existing["id"])
+        new_confidence = min(0.95, max(float(existing["confidence"]), confidence) + 0.03)
+        conn.execute(
+            """
+            UPDATE memory_items
+            SET confidence = ?,
+                last_seen_at = ?,
+                evidence_count = evidence_count + 1,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (new_confidence, now, now, memory_id),
+        )
+        conn.execute(
+            "DELETE FROM memory_items_fts WHERE rowid = ?",
+            (memory_id,),
+        )
+        conn.execute(
+            "INSERT INTO memory_items_fts(rowid, text, kind, scope) VALUES (?, ?, ?, ?)",
+            (memory_id, normalized, kind, scope),
+        )
+        event_type = "reinforced"
+        result = "updated"
+    else:
+        cur = conn.execute(
+            """
+            INSERT INTO memory_items(
+              text, kind, scope, status, confidence, first_seen_at, last_seen_at,
+              evidence_count, source_hash, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (normalized, kind, scope, status, confidence, now, now, source_hash, now),
+        )
+        memory_id = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO memory_items_fts(rowid, text, kind, scope) VALUES (?, ?, ?, ?)",
+            (memory_id, normalized, kind, scope),
+        )
+        event_type = "created"
+        result = "inserted"
+    conn.execute(
+        """
+        INSERT INTO memory_evidence(memory_id, source_type, source_path, source_excerpt, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (memory_id, source_type, source_path, normalized[:900], now),
+    )
+    conn.execute(
+        "INSERT INTO memory_events(memory_id, event_type, note, created_at) VALUES (?, ?, ?, ?)",
+        (memory_id, event_type, f"{source_type}:{source_path}", now),
+    )
+    return result, memory_id
+
+
+def render_soft_memory_view(conn: sqlite3.Connection) -> Path:
+    CANON_DIR.mkdir(parents=True, exist_ok=True)
+    path = CANON_DIR / "soft.md"
+    rows = conn.execute(
+        """
+        SELECT kind, scope, text, status, confidence, evidence_count, updated_at
+        FROM memory_items
+        WHERE status IN ('soft', 'canon')
+        ORDER BY scope, kind, confidence DESC, updated_at DESC
+        LIMIT 500
+        """
+    ).fetchall()
+    lines = [
+        "# Soft Memory",
+        "",
+        "Generated from SQLite memory_items. Do not edit by hand.",
+        "",
+    ]
+    current = ""
+    for row in rows:
+        heading = f"{row['scope']} / {row['kind']}"
+        if heading != current:
+            if current:
+                lines.append("")
+            lines.extend([f"## {heading}", ""])
+            current = heading
+        lines.append(
+            f"- {row['text']} "
+            f"(status={row['status']}, confidence={float(row['confidence']):.2f}, evidence={row['evidence_count']})"
+        )
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return path
+
+
+def retrieve_memory_items(cwd: str, prompt: str, limit: int = 4) -> list[tuple[float, sqlite3.Row]]:
+    conn = connect()
+    init_db(conn)
+    q_terms = tokens(prompt)
+    p_scope = scope_for_cwd(cwd)
+    terms = list(dict.fromkeys(q_terms + project_terms(cwd)))
+    if not terms:
+        return []
+    rows: list[sqlite3.Row] = []
+    query = fts_query(terms)
+    if query:
+        try:
+            rows.extend(
+                conn.execute(
+                    """
+                    SELECT m.*, bm25(memory_items_fts) AS rank
+                    FROM memory_items_fts
+                    JOIN memory_items m ON m.id = memory_items_fts.rowid
+                    WHERE memory_items_fts MATCH ?
+                      AND m.status IN ('soft', 'canon')
+                      AND m.confidence >= 0.70
+                    ORDER BY rank
+                    LIMIT 40
+                    """,
+                    (query,),
+                ).fetchall()
+            )
+        except sqlite3.OperationalError:
+            pass
+    rows.extend(
+        conn.execute(
+            """
+            SELECT *, -10.0 AS rank
+            FROM memory_items
+            WHERE status IN ('soft', 'canon')
+              AND confidence >= 0.78
+              AND scope IN (?, 'global')
+            ORDER BY updated_at DESC
+            LIMIT 15
+            """,
+            (p_scope,),
+        ).fetchall()
+    )
+    scored: list[tuple[float, sqlite3.Row]] = []
+    seen: set[int] = set()
+    for row in rows:
+        row_id = int(row["id"])
+        if row_id in seen:
+            continue
+        seen.add(row_id)
+        haystack = f"{row['text']} {row['kind']} {row['scope']}".lower()
+        scope = str(row["scope"])
+        scope_terms = [t for t in re.split(r"[:/_-]", scope.lower()) if t]
+        if scope not in {p_scope, "global"} and not any(term in q_terms for term in scope_terms):
+            continue
+        score = float(row["confidence"]) * 5.0 + min(int(row["evidence_count"]), 6) * 0.35
+        if row["scope"] == p_scope:
+            score += 4.0
+        elif row["scope"] == "global":
+            score += 1.0
+        for term in q_terms:
+            if term in haystack:
+                score += 2.2
+        for term in project_terms(cwd):
+            if term in haystack:
+                score += 1.4
+        scored.append((score, row))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[:limit]
+
+
 def retrieve_with_trace(cwd: str, prompt: str, limit: int = 8) -> RetrievalTrace:
     ensure_index()
     conn = connect()
@@ -595,6 +919,20 @@ def retrieve_with_trace(cwd: str, prompt: str, limit: int = 8) -> RetrievalTrace
             ).fetchall()
         )
 
+    if PROFILE_TERMS.intersection(q_terms):
+        rows.extend(
+            conn.execute(
+                """
+                SELECT *, -9.0 AS rank
+                FROM chunks
+                WHERE path IN (?, ?)
+                ORDER BY chunk_index
+                LIMIT 8
+                """,
+                (str(PROJECTS_ROOT / "USER.md"), str(PROJECTS_ROOT / "MEMORY.md")),
+            ).fetchall()
+        )
+
     scored: list[tuple[float, sqlite3.Row]] = []
     seen: set[int] = set()
     for row in rows:
@@ -611,6 +949,12 @@ def retrieve_with_trace(cwd: str, prompt: str, limit: int = 8) -> RetrievalTrace
                 score += 4.0
         if str(row["path"]).startswith(cwd_path.rstrip("/") + "/"):
             score += 8.0
+        if PROFILE_TERMS.intersection(q_terms):
+            filename = Path(str(row["path"])).name
+            if filename == "USER.md":
+                score += 14.0
+            elif filename == "MEMORY.md":
+                score += 5.0
         age_days = max((time.time() - float(row["mtime"])) / 86400, 0)
         score += max(0, 3.0 - min(age_days / 30.0, 3.0))
         scored.append((score, row))
@@ -628,7 +972,8 @@ def retrieve_with_trace(cwd: str, prompt: str, limit: int = 8) -> RetrievalTrace
         unique.append((score, row))
         if len(unique) >= limit:
             break
-    return RetrievalTrace(cwd, prompt, q_terms, p_terms, query, candidates_seen, unique)
+    memory_matches = retrieve_memory_items(cwd, prompt, limit=4)
+    return RetrievalTrace(cwd, prompt, q_terms, p_terms, query, candidates_seen, unique, memory_matches)
 
 
 def retrieve(cwd: str, prompt: str, limit: int = 8) -> list[sqlite3.Row]:
@@ -639,7 +984,7 @@ def build_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
     if prompt.strip().lower() in TRIVIAL_PROMPTS:
         return ""
     trace = retrieve_with_trace(cwd, prompt)
-    if not trace.matches:
+    if not trace.matches and not trace.memory_matches:
         return ""
 
     terms = list(dict.fromkeys(trace.query_terms + trace.project_terms))
@@ -650,6 +995,19 @@ def build_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
         "",
     ]
     used = 0
+    for _, row in trace.memory_matches:
+        item = (
+            f"## Memory: {row['kind']} ({row['scope']})\n"
+            f"- source: jmem_memory\n"
+            f"- status: {row['status']}\n"
+            f"- confidence: {float(row['confidence']):.2f}\n"
+            f"- evidence_count: {row['evidence_count']}\n"
+            f"- memory: {row['text']}\n"
+        )
+        if used + len(item) > max_chars:
+            break
+        lines.append(item)
+        used += len(item)
     for _, row in trace.matches:
         item = (
             f"## {row['title']}\n"
@@ -667,6 +1025,7 @@ def build_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
 def explain_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
     trace = retrieve_with_trace(cwd, prompt)
     rows = [row for _, row in trace.matches]
+    memory_rows = [row for _, row in trace.memory_matches]
     context = build_context(cwd, prompt, max_chars)
     terms = list(dict.fromkeys(trace.query_terms + trace.project_terms))
     lines = [
@@ -677,9 +1036,20 @@ def explain_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
         f"project_terms: {', '.join(trace.project_terms) or '(none)'}",
         f"fts_query: {trace.fts_query or '(none)'}",
         f"candidates_seen: {trace.candidates_seen}",
+        f"memory_selected: {len(memory_rows)}",
         f"selected: {len(rows)}",
         "",
     ]
+    for idx, (score, row) in enumerate(trace.memory_matches, start=1):
+        lines.extend([
+            f"## Memory {idx}. {row['kind']} ({row['scope']})",
+            f"- score: {score:.2f}",
+            f"- status: {row['status']}",
+            f"- confidence: {float(row['confidence']):.2f}",
+            f"- evidence_count: {row['evidence_count']}",
+            f"- text: {row['text']}",
+            "",
+        ])
     for idx, (score, row) in enumerate(trace.matches, start=1):
         lines.extend([
             f"## {idx}. {row['title']}",
@@ -728,12 +1098,21 @@ def cmd_stats(_: argparse.Namespace) -> int:
     sources = conn.execute(
         "SELECT source, COUNT(DISTINCT path) files, COUNT(*) chunks FROM chunks GROUP BY source ORDER BY source"
     ).fetchall()
+    memory_rows = conn.execute(
+        "SELECT status, kind, COUNT(*) count FROM memory_items GROUP BY status, kind ORDER BY status, kind"
+    ).fetchall()
     last = conn.execute("SELECT value FROM metadata WHERE key = 'last_indexed_at'").fetchone()
+    consolidated = conn.execute("SELECT value FROM metadata WHERE key = 'last_consolidated_at'").fetchone()
     print(f"db={DB_PATH}")
     print(f"last_indexed_at={last['value'] if last else 'unknown'}")
+    print(f"last_consolidated_at={consolidated['value'] if consolidated else 'unknown'}")
     print(f"files={row['files']} chunks={row['chunks']}")
     for source_row in sources:
         print(f"{source_row['source']}: files={source_row['files']} chunks={source_row['chunks']}")
+    if memory_rows:
+        print("memory_items=" + ", ".join(
+            f"{r['status']}/{r['kind']}:{r['count']}" for r in memory_rows
+        ))
     return 0
 
 
@@ -797,6 +1176,10 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     counts = conn.execute(
         "SELECT COUNT(DISTINCT path) files, COUNT(*) chunks FROM chunks"
     ).fetchone()
+    memory_counts = conn.execute(
+        "SELECT status, kind, COUNT(*) count FROM memory_items GROUP BY status, kind ORDER BY status, kind"
+    ).fetchall()
+    last_consolidated = conn.execute("SELECT value FROM metadata WHERE key = 'last_consolidated_at'").fetchone()
     source_rows = conn.execute(
         "SELECT source, COUNT(DISTINCT path) files FROM chunks GROUP BY source ORDER BY source"
     ).fetchall()
@@ -813,8 +1196,16 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"root={ROOT}")
     print(f"db={DB_PATH} exists={DB_PATH.exists()}")
     print(f"last_indexed_at={last['value'] if last else 'unknown'}")
+    print(f"last_consolidated_at={last_consolidated['value'] if last_consolidated else 'unknown'}")
     print(f"files={counts['files']} chunks={counts['chunks']}")
     print("sources=" + ", ".join(f"{r['source']}:{r['files']}" for r in source_rows))
+    print(
+        "memory_items="
+        + (
+            ", ".join(f"{r['status']}/{r['kind']}:{r['count']}" for r in memory_counts)
+            if memory_counts else "none"
+        )
+    )
     print(f"codex_user_prompt_hook={config_has_command(HOME / '.codex/hooks.json', codex_hook)}")
     print(f"codex_stop_hook={config_has_command(HOME / '.codex/hooks.json', codex_stop)}")
     print(f"claude_user_prompt_hook={config_has_command(HOME / '.claude/settings.json', claude_hook)}")
@@ -823,6 +1214,8 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"granola_cache_files={len(list(GRANOLA_CACHE_DIR.glob('*.md'))) if GRANOLA_CACHE_DIR.exists() else 0}")
     print(f"granola_launchagent_file={(HOME / 'Library/LaunchAgents/com.jmem.granola-sync.plist').exists()}")
     print(f"granola_launchagent_loaded={launchagent_loaded('com.jmem.granola-sync')}")
+    print(f"consolidate_launchagent_file={(HOME / 'Library/LaunchAgents/com.jmem.consolidate.plist').exists()}")
+    print(f"consolidate_launchagent_loaded={launchagent_loaded('com.jmem.consolidate')}")
     print(f"hook_log={LOG_PATH} exists={LOG_PATH.exists()}")
     print(f"recent_hook_events={len(logs)} recent_injections={len(injected)}")
     print(f"candidate_files={len(candidates)}")
@@ -914,7 +1307,7 @@ def extract_candidate_lines(text: str, limit: int = 12) -> list[str]:
     )
     for raw in text.splitlines():
         line = re.sub(r"\s+", " ", raw).strip(" -\t")
-        if len(line) < 12 or len(line) > 260:
+        if len(line) < 12 or len(line) > 520:
             continue
         if patterns.search(line):
             candidates.append(line)
@@ -923,7 +1316,7 @@ def extract_candidate_lines(text: str, limit: int = 12) -> list[str]:
     if not candidates:
         compact = re.sub(r"\s+", " ", text).strip()
         if compact:
-            candidates.append(compact[:240])
+            candidates.append(compact[:480])
     return list(dict.fromkeys(candidates))[:limit]
 
 
@@ -953,7 +1346,7 @@ def write_candidate(
         "",
         "# Memory Candidate",
         "",
-        "Review these before promoting anything into canonical memory.",
+        "Audit trail for automatic consolidation. Manual review is optional.",
         "",
         "## Candidate memories",
         "",
@@ -1075,6 +1468,118 @@ def append_canon(bucket: str, lines: list[str], source_path: Path) -> Path:
     return path
 
 
+def consolidate_candidate_file(
+    conn: sqlite3.Connection,
+    path: Path,
+    min_confidence: float,
+    dry_run: bool,
+) -> dict[str, int]:
+    meta = parse_candidate_frontmatter(path)
+    scope = scope_for_cwd(meta.get("cwd") or "")
+    counts = {"inserted": 0, "updated": 0, "skipped": 0}
+    for line in candidate_memory_lines(path):
+        kind, confidence = classify_memory(line)
+        if kind == "skip" or confidence < min_confidence:
+            counts["skipped"] += 1
+            continue
+        if dry_run:
+            counts["inserted"] += 1
+            continue
+        result, _ = upsert_memory_item(
+            conn,
+            text=line,
+            kind=kind,
+            scope=scope,
+            status="soft",
+            confidence=confidence,
+            source_type=meta.get("source") or "candidate",
+            source_path=str(path),
+        )
+        counts[result] = counts.get(result, 0) + 1
+    return counts
+
+
+def consolidate_candidates(args: argparse.Namespace) -> int:
+    conn = connect()
+    init_db(conn)
+    limit = max(int(getattr(args, "limit", 50) or 0), 0)
+    dry_run = bool(getattr(args, "dry_run", False))
+    quiet = bool(getattr(args, "quiet", False))
+    min_confidence = float(getattr(args, "min_confidence", 0.78))
+    paths = active_candidate_paths(limit=limit)
+    totals = {
+        "processed": 0,
+        "inserted": 0,
+        "updated": 0,
+        "skipped": 0,
+        "accepted_candidates": 0,
+        "rejected_candidates": 0,
+    }
+    for path in paths:
+        counts = consolidate_candidate_file(conn, path, min_confidence, dry_run)
+        promoted = counts.get("inserted", 0) + counts.get("updated", 0)
+        totals["processed"] += 1
+        totals["inserted"] += counts.get("inserted", 0)
+        totals["updated"] += counts.get("updated", 0)
+        totals["skipped"] += counts.get("skipped", 0)
+        if not quiet:
+            print(
+                f"{path.name}: inserted={counts.get('inserted', 0)} "
+                f"updated={counts.get('updated', 0)} skipped={counts.get('skipped', 0)}"
+            )
+        if dry_run:
+            continue
+        if promoted:
+            update_candidate_status(path, "accepted", [f"- consolidated_lines: {promoted}"])
+            move_candidate(path, "accepted")
+            totals["accepted_candidates"] += 1
+        else:
+            update_candidate_status(path, "rejected", [f"- reason: no high-confidence memory lines"])
+            move_candidate(path, "rejected")
+            totals["rejected_candidates"] += 1
+    soft_path = ""
+    if not dry_run:
+        soft_path = str(render_soft_memory_view(conn))
+        set_metadata(conn, "last_consolidated_at", now_utc())
+        conn.commit()
+        if bool(getattr(args, "index", False)):
+            index_sources(None)
+    if not quiet:
+        print(
+            "consolidated "
+            + " ".join(f"{key}={value}" for key, value in totals.items())
+            + (f" soft_view={soft_path}" if soft_path else "")
+            + (" dry_run=true" if dry_run else "")
+        )
+    return 0
+
+
+def maybe_auto_consolidate(limit: int = 25, debounce_seconds: int = 600) -> None:
+    if os.environ.get("JMEM_DISABLE_AUTO_CONSOLIDATE"):
+        return
+    try:
+        conn = connect()
+        init_db(conn)
+        last = get_metadata(conn, "last_consolidated_at")
+        if last:
+            last_dt = dt.datetime.fromisoformat(last)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=dt.timezone.utc)
+            age = (dt.datetime.now(dt.timezone.utc) - last_dt).total_seconds()
+            if age < debounce_seconds:
+                return
+        args = argparse.Namespace(
+            limit=limit,
+            dry_run=False,
+            quiet=True,
+            min_confidence=0.78,
+            index=False,
+        )
+        consolidate_candidates(args)
+    except Exception:
+        return
+
+
 def candidate_text_from_event(event: dict) -> tuple[str, str]:
     transcript_path = str(event.get("transcript_path") or event.get("transcriptPath") or "")
     pieces = []
@@ -1144,6 +1649,26 @@ def cmd_candidates_accept(args: argparse.Namespace) -> int:
         return 1
     moved = move_candidate(path, "accepted")
     canon_path = append_canon(args.bucket, lines, moved)
+    conn = connect()
+    init_db(conn)
+    scope = scope_for_cwd(parse_candidate_frontmatter(moved).get("cwd") or "")
+    for line in lines:
+        kind, confidence = classify_memory(line)
+        if kind == "skip":
+            kind, confidence = "general", 0.90
+        upsert_memory_item(
+            conn,
+            text=line,
+            kind=kind,
+            scope=scope,
+            status="canon",
+            confidence=max(confidence, 0.90),
+            source_type="manual_accept",
+            source_path=str(moved),
+        )
+    render_soft_memory_view(conn)
+    set_metadata(conn, "last_consolidated_at", now_utc())
+    conn.commit()
     update_candidate_status(moved, "accepted", [f"- canon_path: {canon_path}", f"- accepted_lines: {len(lines)}"])
     print(f"accepted={moved}")
     print(f"canon={canon_path}")
@@ -1183,7 +1708,11 @@ def cmd_candidates_prune(args: argparse.Namespace) -> int:
 def log_hook(event: dict, injected: str, trace: RetrievalTrace | None = None, candidate_path: str = "") -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     top_rows = [row for _, row in trace.matches] if trace else []
-    top_sources = list(dict.fromkeys(str(row["source"]) for row in top_rows))
+    memory_rows = [row for _, row in trace.memory_matches] if trace else []
+    top_sources = list(dict.fromkeys(
+        [str(row["source"]) for row in top_rows]
+        + (["jmem_memory"] if memory_rows else [])
+    ))
     top_paths = [str(row["path"]) for row in top_rows[:5]]
     record = {
         "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -1195,6 +1724,7 @@ def log_hook(event: dict, injected: str, trace: RetrievalTrace | None = None, ca
         "injected_chars": len(injected),
         "top_sources": top_sources,
         "top_paths": top_paths,
+        "memory_items": len(memory_rows),
         "granola_used": any(source == "granola_api" for source in top_sources),
         "candidate_path": candidate_path,
     }
@@ -1220,6 +1750,8 @@ def hook_main(argv: list[str]) -> int:
             session_id=str(event.get("session_id") or ""),
             transcript_path=transcript_path,
         )
+        if candidate:
+            maybe_auto_consolidate()
         log_hook(event, "", None, str(candidate) if candidate else "")
         return 0
 
@@ -1265,6 +1797,8 @@ def claude_hook_main(argv: list[str]) -> int:
             session_id=str(event.get("session_id") or ""),
             transcript_path=transcript_path,
         )
+        if candidate:
+            maybe_auto_consolidate()
         log_hook(event, "", None, str(candidate) if candidate else "")
         return 0
 
@@ -1317,6 +1851,14 @@ def main() -> int:
     p_context.add_argument("--explain", action="store_true", help="Show retrieval terms, selected matches, and context")
     p_context.set_defaults(func=cmd_context)
 
+    p_consolidate = sub.add_parser("consolidate", help="Promote high-confidence candidates into SQLite memory")
+    p_consolidate.add_argument("--limit", type=int, default=50, help="Maximum active candidates to process")
+    p_consolidate.add_argument("--min-confidence", type=float, default=0.78)
+    p_consolidate.add_argument("--dry-run", action="store_true")
+    p_consolidate.add_argument("--quiet", action="store_true")
+    p_consolidate.add_argument("--index", action="store_true", help="Re-index source files after writing the Markdown view")
+    p_consolidate.set_defaults(func=consolidate_candidates)
+
     p_doctor = sub.add_parser("doctor", help="Check jmem hook, index, Granola, and log health")
     p_doctor.set_defaults(func=cmd_doctor)
 
@@ -1326,10 +1868,10 @@ def main() -> int:
     p_trace.add_argument("--json", action="store_true", help="Emit raw hook log records as JSON")
     p_trace.set_defaults(func=cmd_trace)
 
-    p_candidates = sub.add_parser("candidates", help="Create or list reviewable memory candidates")
+    p_candidates = sub.add_parser("candidates", help="Create or list memory candidate audit files")
     candidates_sub = p_candidates.add_subparsers(dest="candidate_cmd", required=True)
 
-    p_candidates_add = candidates_sub.add_parser("add", help="Write a reviewable memory candidate from text")
+    p_candidates_add = candidates_sub.add_parser("add", help="Write a memory candidate audit file from text")
     p_candidates_add.add_argument("--cwd", default=os.getcwd())
     p_candidates_add.add_argument("--source", default="manual")
     p_candidates_add.add_argument("--session-id", default="")

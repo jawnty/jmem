@@ -15,14 +15,23 @@
   - `jmem candidates accept`
   - `jmem candidates reject`
   - `jmem candidates prune`
+- SQLite structured memory:
+  - `memory_items`
+  - `memory_evidence`
+  - `memory_events`
+- Automatic consolidation from candidate audit files into soft memory.
+- Hourly macOS LaunchAgent for background consolidation.
+- Scoped retrieval from both structured memory and source snippets.
 
 ## Next
 
-- Improve the curated extracted-memory layer:
-  - `memory/people/`
-  - `memory/projects/`
-  - candidate-to-bucket suggestions
+- Improve extraction quality:
+  - better atomic splitting
+  - better assistant-chatter rejection
+  - contradiction handling
+  - confidence decay
 - Add source-level privacy scopes and retrieval budgets.
 - Add tombstones for deleted/404 Granola notes.
+- Add entity views for people, projects, companies, and recurring preferences.
 - Add optional embeddings after FTS misses are observed.
 - Add MCP tools for explicit lookup and writeback.

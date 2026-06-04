@@ -11,6 +11,7 @@ The v0 principle is simple: **broad index, narrow injection**.
 - Store generated indexes, logs, and meeting-note caches outside git.
 - Inject source-labeled snippets, not a giant second-brain dump.
 - Make retrieval observable before making memory smarter.
+- Keep extracted memory in SQLite; Markdown is only a generated local view.
 
 ## How jmem Works
 
@@ -24,12 +25,15 @@ flowchart TB
   granola["Granola notes<br/>meetings, transcripts"]
 
   cache[("Local markdown cache<br/>gitignored")]
-  jmem["jmem<br/>index + retrieve"]
+  jmem["jmem<br/>index + retrieve<br/>consolidate"]
   index[("SQLite FTS index<br/>gitignored")]
+  structured[("SQLite memory_items<br/>evidence + events<br/>gitignored")]
 
   user["You type a prompt<br/>Codex or Claude Code"]
   hook["UserPromptSubmit hook<br/>before each agent turn"]
   packet["Memory packet<br/>small, relevant, source-labeled"]
+  stop["Stop hook<br/>after useful sessions"]
+  candidates["Candidate audit trail<br/>gitignored"]
   agent["Agent response<br/>with ambient context"]
 
   docs --> jmem
@@ -38,10 +42,15 @@ flowchart TB
   cache --> jmem
 
   jmem --> index
+  jmem --> structured
   index --> hook
+  structured --> hook
   user --> hook
   hook --> packet
   packet --> agent
+  agent --> stop
+  stop --> candidates
+  candidates --> jmem
 
   classDef source fill:#f8fafc,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
   classDef core fill:#e0f2fe,stroke:#0284c7,stroke-width:3px,color:#082f49;
@@ -50,7 +59,7 @@ flowchart TB
 
   class jmem core;
   class docs,memory,granola source;
-  class cache,index store;
+  class cache,index,structured,candidates store;
   class user,hook,packet,agent runtime;
 ```
 
@@ -60,13 +69,16 @@ Refresh behavior:
   when the index is stale.
 - **Auto-poll:** Granola can sync hourly into the gitignored local cache when
   the optional launchd sync is installed.
+- **Auto-consolidate:** Stop hooks and an optional hourly LaunchAgent promote
+  high-confidence candidate lines into SQLite `memory_items`.
 - **Per turn:** each prompt retrieves from the local index; jmem does not
   reread every source live.
 
 ## What v0 Does
 
 - Indexes project docs named `AGENTS.md`, `CLAUDE.md`, `README.md`,
-  `PROGRESS.md`, and `HEARTBEAT.md` under a configured projects root.
+  `PROGRESS.md`, `HEARTBEAT.md`, `USER.md`, and `MEMORY.md` under a
+  configured projects root.
 - Indexes common local agent memory folders when present:
   - `~/.codex/memories/`
   - `~/.codex/automations/`
@@ -78,9 +90,9 @@ Refresh behavior:
 - Injects context into Codex and Claude Code through local hooks.
 - Shows what happened with `jmem doctor`, `jmem trace`, and
   `jmem context --explain`.
-- Writes reviewable memory candidates from `Stop` hooks without promoting them
-  into canonical memory automatically.
-- Uses SQLite FTS only. No cloud database, no embeddings, no external service.
+- Writes candidate audit files from `Stop` hooks and automatically consolidates
+  high-confidence durable lines into SQLite `memory_items`.
+- Uses local SQLite only. No cloud database, no embeddings, no external service.
 
 ## Install
 
@@ -138,6 +150,7 @@ jmem context --cwd "$PWD" --prompt "why did morning brief fail?"
 jmem context --cwd "$PWD" --prompt "why did morning brief fail?" --explain
 jmem doctor
 jmem trace --limit 5
+jmem consolidate --dry-run
 ```
 
 The context command prints what hooks inject into an agent turn:
@@ -178,8 +191,9 @@ The installer also adds a `Stop` hook:
 ~/projects/jmem/bin/jmem-codex-hook stop
 ```
 
-Stop hooks write reviewable memory candidates under `memory/candidates/` when
-the hook event includes useful summary, prompt, response, or transcript text.
+Stop hooks write candidate audit files under `memory/candidates/` when the hook
+event includes useful summary, prompt, response, or transcript text. jmem can
+then consolidate high-confidence lines into SQLite automatically.
 
 ## Claude Code Hook
 
@@ -207,7 +221,8 @@ The installer also adds a `Stop` hook:
 ```
 
 Claude Code Stop hook events can include transcript paths. jmem reads those when
-available and writes reviewable memory candidates under `memory/candidates/`.
+available, writes candidate audit files under `memory/candidates/`, and can
+consolidate high-confidence lines into SQLite automatically.
 
 ## Observability
 
@@ -240,15 +255,16 @@ That folder is gitignored.
 
 ## Memory Candidates
 
-Stop hooks and manual commands write reviewable candidates:
+Stop hooks and manual commands write candidate audit files:
 
 ```bash
-jmem candidates add --cwd "$PWD" --text "Decision: keep writeback reviewable."
+jmem candidates add --cwd "$PWD" --text "Decision: keep writeback ambient."
 jmem candidates list
 jmem candidates show
 jmem candidates accept 1 --bucket preferences
 jmem candidates reject 1 --reason "not durable"
 jmem candidates prune --days 30 --dry-run
+jmem consolidate --dry-run
 ```
 
 Candidates are stored in:
@@ -258,17 +274,31 @@ memory/candidates/
 ```
 
 That folder is gitignored because candidates can contain private session
-details.
+details. You normally do not need to review it; it is mainly for debugging.
 
-Accepted candidates append selected memory lines into:
+Automatic consolidation writes extracted memories into SQLite first:
 
 ```text
-memory/canon/<bucket>.md
+memory_items
+memory_evidence
+memory_events
 ```
 
-That folder is also gitignored. Canon files are still local, human-reviewed
+It also generates a local Markdown view:
+
+```text
+memory/canon/soft.md
+```
+
+That folder is also gitignored. Canon files are local views or manually accepted
 memory, not public documentation. Rejected and accepted source candidates are
 moved under `memory/candidates/rejected/` and `memory/candidates/accepted/`.
+
+Install the optional hourly consolidator:
+
+```bash
+./scripts/install-consolidate-launchd --load
+```
 
 ## Granola
 
@@ -318,9 +348,34 @@ Examples of `source` values:
 - `clawmail_note`
 - `openclaw_note`
 
-The current v0 does not yet maintain a curated extracted-memory store. It
-retrieves source snippets directly. See [ROADMAP.md](ROADMAP.md) for the next
-layer.
+SQLite also stores extracted working memory:
+
+```text
+memory_items:
+  text
+  kind              # preference, decision, project_fact, correction, todo...
+  scope             # global or project:<name>
+  status            # soft, canon, rejected, tombstoned
+  confidence
+  first_seen_at
+  last_seen_at
+  evidence_count
+  source_hash
+
+memory_evidence:
+  memory_id
+  source_type
+  source_path
+  source_excerpt
+
+memory_events:
+  memory_id
+  event_type
+  note
+```
+
+Retrieval pulls both structured `memory_items` and source snippets. Structured
+memory is scoped, confidence-filtered, and source-labeled as `jmem_memory`.
 
 ## Safety
 
