@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import tomllib
+
+try:
+    import tomllib
+except ImportError:  # pre-3.11 interpreter: run on DEFAULTS only
+    tomllib = None
 
 
 DEFAULTS: dict = {
@@ -108,7 +112,7 @@ def load_config(root: Path | None = None) -> dict:
 
         root = core_root
     path = config_path(root)
-    if not path.exists():
+    if tomllib is None or not path.exists():
         return dict(DEFAULTS)
     try:
         with path.open("rb") as fh:

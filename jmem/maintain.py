@@ -75,10 +75,10 @@ def granola_sync(config: dict) -> str:
         recent=30, limit=0, force=False, sleep=0.22, verbose=False, index=False
     )
     try:
-        core.sync_granola_notes(args)
+        rc = core.sync_granola_notes(args)
     except Exception as exc:  # network failures must not kill the run
         return f"failed:{exc.__class__.__name__}"
-    return "synced"
+    return "synced" if rc == 0 else f"failed:rc{rc}"
 
 
 def prune_candidates(config: dict) -> int:
