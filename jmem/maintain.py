@@ -213,6 +213,112 @@ def cmd_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def _item_texts(conn: sqlite3.Connection, item_ids: list[str]) -> list[str]:
+    texts: list[str] = []
+    for ref in item_ids[:8]:
+        try:
+            prefix, raw_id = ref.split(":", 1)
+            row_id = int(raw_id)
+        except ValueError:
+            continue
+        if prefix == "m":
+            row = conn.execute(
+                "SELECT text FROM memory_items WHERE id=?", (row_id,)
+            ).fetchone()
+            if row:
+                texts.append(str(row["text"]))
+        elif prefix == "c":
+            row = conn.execute(
+                "SELECT title, content FROM chunks WHERE id=?", (row_id,)
+            ).fetchone()
+            if row:
+                texts.append(f"{row['title']}: {str(row['content'])[:220]}")
+    return texts
+
+
+def grade_effectiveness(config: dict, max_injections: int = 20, max_gaps: int = 10) -> str:
+    """Precision/miss tracking (replaces the holdout as the primary
+    effectiveness signal): grade recent injections for relevance and recent
+    silent prompts for misses. Runs only from the maintainer."""
+    if not judge_mod.judge_available(config):
+        return "no-judge"
+    conn = core.connect()
+    core.init_db(conn)
+    last_ts = core.get_metadata(conn, "last_graded_ts") or ""
+    inj_events: list[dict] = []
+    gap_events: list[dict] = []
+    newest_ts = last_ts
+    if core.LOG_PATH.exists():
+        for line in core.LOG_PATH.read_text(errors="ignore").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = str(record.get("ts") or "")
+            if ts <= last_ts or record.get("event") != "UserPromptSubmit":
+                continue
+            if record.get("holdout"):
+                continue
+            prompt = str(record.get("prompt_prefix") or "")
+            if not prompt:
+                continue
+            items = record.get("injected_items") or []
+            gated = str(record.get("gated") or "")
+            if items and len(inj_events) < max_injections:
+                inj_events.append({"ts": ts, "session": record.get("session_id") or "",
+                                   "prompt": prompt,
+                                   "item_ids": [i.get("id", "") for i in items]})
+                newest_ts = max(newest_ts, ts)
+            elif gated in {"below_threshold", "delta_empty"} and len(gap_events) < max_gaps:
+                gap_events.append({"ts": ts, "session": record.get("session_id") or "",
+                                   "prompt": prompt,
+                                   "cwd": record.get("cwd") or str(core.PROJECTS_ROOT)})
+                newest_ts = max(newest_ts, ts)
+    now = core.now_utc()
+    graded = missed = 0
+    if inj_events:
+        payload = [{"prompt": e["prompt"], "items": _item_texts(conn, e["item_ids"])}
+                   for e in inj_events]
+        grades = judge_mod.grade_injections(payload, config)
+        if grades:
+            for event, grade in zip(inj_events, grades):
+                if grade == "skipped":
+                    continue
+                conn.execute(
+                    "INSERT INTO injection_grades(event_ts, session_id, kind, grade,"
+                    " prompt_prefix, detail, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (event["ts"], event["session"], "injection", grade,
+                     event["prompt"][:300], ",".join(event["item_ids"][:10]), now),
+                )
+                graded += 1
+    if gap_events:
+        payload = []
+        for event in gap_events:
+            trace = core.retrieve_with_trace(event["cwd"], event["prompt"])
+            candidates = [str(r["text"]) for _, r in trace.memory_matches[:4]]
+            candidates += [f"{r['title']}: {str(r['content'])[:200]}"
+                           for _, r in trace.matches[:4]]
+            payload.append({"prompt": event["prompt"], "candidates": candidates})
+        verdicts = judge_mod.grade_gaps(payload, config)
+        if verdicts:
+            for event, verdict in zip(gap_events, verdicts):
+                if verdict == "skipped":
+                    continue
+                conn.execute(
+                    "INSERT INTO injection_grades(event_ts, session_id, kind, grade,"
+                    " prompt_prefix, detail, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (event["ts"], event["session"], "gap", verdict,
+                     event["prompt"][:300], "", now),
+                )
+                if verdict == "miss":
+                    missed += 1
+    if newest_ts > last_ts:
+        core.set_metadata(conn, "last_graded_ts", newest_ts)
+    conn.commit()
+    conn.close()
+    return f"graded:{graded} gaps:{len(gap_events)} misses:{missed}"
+
+
 def cmd_maintain(args: argparse.Namespace) -> int:
     config = get_config()
     started = time.time()
@@ -225,6 +331,7 @@ def cmd_maintain(args: argparse.Namespace) -> int:
             ("granola", lambda: granola_sync(config)),
             ("index", lambda: index_if_needed(config)),
             ("consolidate", lambda: core.run_consolidation(limit=200, use_judge=True)),
+            ("grade", lambda: grade_effectiveness(config)),
             ("prune", lambda: prune_candidates(config)),
             ("rotate_log", lambda: rotate_hook_log(config)),
             ("sessions", lambda: clean_session_state(config)),

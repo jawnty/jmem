@@ -84,6 +84,90 @@ Every input id must appear exactly once.
 """
 
 
+GRADE_INSTRUCTIONS = """\
+You grade a memory system's injections. For each numbered event you receive
+the user's prompt (possibly truncated) and the memory items that were
+injected into the session before the agent answered.
+
+Grade each event as a whole:
+- "relevant": most injected items plausibly help answer or contextualize
+  this prompt.
+- "partial": at least one item helps; the rest are off-topic.
+- "noise": nothing injected relates to this prompt.
+
+Output STRICT JSON only, no prose, no code fences: a JSON array where each
+element is {"event": <int>, "grade": "relevant"|"partial"|"noise"}.
+Every input event number must appear exactly once.
+"""
+
+GAP_INSTRUCTIONS = """\
+You audit a memory system for missed injections. For each numbered event you
+receive a user's prompt where the system injected NOTHING, plus the top
+memory candidates that existed in the store at that time.
+
+Decide: did the store contain something that would clearly have helped this
+prompt (a miss), or was staying silent correct (ok)? Only call it a miss
+when a candidate is plainly on-topic and useful — generic or tangential
+matches are "ok".
+
+Output STRICT JSON only, no prose, no code fences: a JSON array where each
+element is {"event": <int>, "verdict": "miss"|"ok"}.
+Every input event number must appear exactly once.
+"""
+
+
+def grade_injections(events: list[dict], config: dict) -> list[str] | None:
+    """Grade injected packets against their prompts. events:
+    [{prompt, items: [text, ...]}]. Returns grades aligned by index, or
+    None if the judge failed ("skipped" fills unanswered slots)."""
+    if not events:
+        return []
+    blocks = []
+    for i, event in enumerate(events):
+        items = "\n".join(f"  - {t[:300]}" for t in event["items"][:8])
+        blocks.append(f"--- EVENT {i} ---\nPrompt: {event['prompt'][:400]}\nInjected:\n{items}")
+    parsed = run_judge(GRADE_INSTRUCTIONS + "\n" + "\n\n".join(blocks), config)
+    if parsed is None:
+        return None
+    out = ["skipped"] * len(events)
+    for entry in parsed:
+        try:
+            idx = int(entry.get("event", -1))
+        except (TypeError, ValueError):
+            continue
+        grade = str(entry.get("grade") or "").strip().lower()
+        if 0 <= idx < len(events) and grade in {"relevant", "partial", "noise"}:
+            out[idx] = grade
+    return out
+
+
+def grade_gaps(events: list[dict], config: dict) -> list[str] | None:
+    """Audit gated/empty injections for misses. events:
+    [{prompt, candidates: [text, ...]}]. Returns "miss"/"ok" aligned by
+    index, or None if the judge failed."""
+    if not events:
+        return []
+    blocks = []
+    for i, event in enumerate(events):
+        cands = "\n".join(f"  - {t[:300]}" for t in event["candidates"][:8])
+        blocks.append(
+            f"--- EVENT {i} ---\nPrompt: {event['prompt'][:400]}\nStore candidates:\n{cands}"
+        )
+    parsed = run_judge(GAP_INSTRUCTIONS + "\n" + "\n\n".join(blocks), config)
+    if parsed is None:
+        return None
+    out = ["skipped"] * len(events)
+    for entry in parsed:
+        try:
+            idx = int(entry.get("event", -1))
+        except (TypeError, ValueError):
+            continue
+        verdict = str(entry.get("verdict") or "").strip().lower()
+        if 0 <= idx < len(events) and verdict in {"miss", "ok"}:
+            out[idx] = verdict
+    return out
+
+
 def judge_available(config: dict) -> bool:
     if os.environ.get("JMEM_DISABLE_JUDGE"):
         return False

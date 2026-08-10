@@ -63,9 +63,14 @@ are NOT yet done.
 
 ## What's Next
 
-1. **Let the holdout accumulate** (~2-4 weeks), then compare injected vs
-   holdout sessions — the causal gate for funding Phase 2 (dashboard, canon
-   lifecycle, reference detection, refactor) per John's decision.
+1. **Holdout DISABLED (2026-08-09, John's call):** Claude Code carries real
+   work; memory must be rich always. `config.toml` sets holdout.enabled=false.
+   The primary effectiveness signal is now the maintainer's grading pass:
+   every hour it LLM-grades recent injections (relevant/partial/noise) and
+   audits silent prompts for misses; `jmem stats` shows precision and
+   miss_rate (first reading: 75% precision on 12 events, 0 misses). Review
+   precision/miss trends in ~2 weeks to decide on Phase 2 and tune the
+   provisional gating thresholds.
 2. **Codex writeback fix (plan 1.1)** — parked; root cause documented in the
    plan (rollout `payload` nesting). Codex usage is ~12% and falling.
 3. **Threshold re-tune** — gating thresholds (chunk_min_score=6.0 etc.) are

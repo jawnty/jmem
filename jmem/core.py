@@ -151,6 +151,18 @@ def init_db(conn: sqlite3.Connection) -> None:
           ON memory_items(scope, status, updated_at);
         CREATE INDEX IF NOT EXISTS idx_memory_items_kind
           ON memory_items(kind);
+        CREATE TABLE IF NOT EXISTS injection_grades (
+          id INTEGER PRIMARY KEY,
+          event_ts TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          kind TEXT NOT NULL,            -- 'injection' or 'gap'
+          grade TEXT NOT NULL,           -- relevant/partial/noise or miss/ok
+          prompt_prefix TEXT NOT NULL,
+          detail TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_injection_grades_kind
+          ON injection_grades(kind, grade);
         """
     )
 
@@ -1308,6 +1320,29 @@ def cmd_stats(_: argparse.Namespace) -> int:
         print(
             f"tokens_injected~={est_tokens:,} (chars={totals['injected_chars']:,}, est chars/4)"
         )
+
+    # Precision / miss-rate from the maintainer's grading pass (the primary
+    # effectiveness signal now that the holdout is optional).
+    grade_rows = conn.execute(
+        "SELECT kind, grade, COUNT(*) count FROM injection_grades GROUP BY kind, grade"
+    ).fetchall()
+    if grade_rows:
+        counts = {(r["kind"], r["grade"]): int(r["count"]) for r in grade_rows}
+        relevant = counts.get(("injection", "relevant"), 0)
+        partial = counts.get(("injection", "partial"), 0)
+        noise = counts.get(("injection", "noise"), 0)
+        graded = relevant + partial + noise
+        miss = counts.get(("gap", "miss"), 0)
+        ok = counts.get(("gap", "ok"), 0)
+        if graded:
+            precision = 100.0 * (relevant + partial) / graded
+            print(
+                f"precision: {precision:.0f}% of {graded} graded injections "
+                f"(relevant={relevant} partial={partial} noise={noise})"
+            )
+        if miss + ok:
+            miss_rate = 100.0 * miss / (miss + ok)
+            print(f"miss_rate: {miss_rate:.0f}% of {miss + ok} audited silent prompts (miss={miss} ok={ok})")
     return 0
 
 
@@ -1987,7 +2022,7 @@ def log_hook(
         "session_id": event.get("session_id"),
         "turn_id": event.get("turn_id"),
         "cwd": event.get("cwd"),
-        "prompt_prefix": (event.get("prompt") or "")[:160],
+        "prompt_prefix": (event.get("prompt") or "")[:300],
         "injected_chars": len(injected),
         "injected_items": injected_items or [],
         "gated": gated,
