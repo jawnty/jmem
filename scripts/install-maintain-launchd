@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Install the unified hourly jmem maintenance LaunchAgent.
+
+com.jmem.maintain replaces BOTH com.jmem.consolidate and
+com.jmem.granola-sync: `jmem maintain` is the single home for background
+mutation (index refresh, granola sync, LLM consolidation, candidate prune,
+log rotation, session-state cleanup, backup). With --load this also unloads
+and removes the two superseded agents.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import subprocess
+
+
+ROOT = Path(__file__).resolve().parents[1]
+HOME = Path.home()
+SUPERSEDED = ["com.jmem.consolidate", "com.jmem.granola-sync"]
+
+
+def plist_text(minute: int) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jmem.maintain</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{ROOT / 'bin/jmem'}</string>
+    <string>maintain</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Minute</key>
+    <integer>{minute}</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>{ROOT / 'logs/maintain.log'}</string>
+
+  <key>StandardErrorPath</key>
+  <string>{ROOT / 'logs/maintain.err.log'}</string>
+</dict>
+</plist>
+"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Install hourly jmem maintain LaunchAgent on macOS.")
+    parser.add_argument("--minute", type=int, default=37)
+    parser.add_argument("--load", action="store_true", help="Load the LaunchAgent and retire superseded agents")
+    args = parser.parse_args()
+    if args.minute < 0 or args.minute > 59:
+        parser.error("--minute must be between 0 and 59")
+    path = HOME / "Library/LaunchAgents/com.jmem.maintain.plist"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(plist_text(args.minute))
+    subprocess.run(["plutil", "-lint", str(path)], check=True)
+    print(f"wrote {path}")
+    if args.load:
+        uid = str(os.getuid())
+        for label in SUPERSEDED:
+            old = HOME / f"Library/LaunchAgents/{label}.plist"
+            if old.exists():
+                subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(old)], check=False)
+                old.rename(old.with_suffix(".plist.superseded"))
+                print(f"retired {label} -> {old.with_suffix('.plist.superseded')}")
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(path)], check=False)
+        subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(path)], check=True)
+        print("loaded com.jmem.maintain")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
