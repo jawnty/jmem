@@ -72,8 +72,12 @@ Refresh behavior:
 - **Relevance gating:** trivial prompts and weak matches get no packet or a
   shrunk packet. Within one session, jmem injects the full packet on the
   first turn and only *new* items on later turns (delta injection).
-- **Holdout:** a deterministic 1-in-N of sessions (default 4) receives no
-  injection at all, so injected vs uninjected sessions can be compared.
+- **Effectiveness grading:** the maintainer LLM-grades recent injections
+  (relevant / partial / noise) and audits silent prompts for misses;
+  `jmem stats` reports precision and miss rate.
+- **Optional holdout:** a deterministic 1-in-N of sessions can receive no
+  injection for A/B comparison (`[holdout]` in `config.toml`; off on this
+  install — grading is the primary signal).
 - **Per turn:** each prompt retrieves from the local index; jmem does not
   reread every source live.
 
@@ -157,7 +161,12 @@ jmem consolidate --dry-run
 jmem maintain
 jmem backup
 jmem config-init
+jmem brain --open
 ```
+
+`jmem brain` renders `brain.html` — a single-file, read-only, searchable
+view of the memory store, grouped by project. The maintainer regenerates it
+hourly.
 
 Retrieval thresholds, the holdout fraction, judge model, and maintenance
 knobs live in `config.toml` (see `jmem config-init` for a commented
