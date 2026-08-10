@@ -1,5 +1,7 @@
 index/
 logs/
+backups/
+config.toml
 memory/granola/
 memory/candidates/
 memory/canon/

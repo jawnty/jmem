@@ -90,6 +90,9 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Concurrent sessions fire hooks against this file simultaneously;
+    # wait briefly on residual contention instead of erroring (plan 1.10).
+    conn.execute("PRAGMA busy_timeout=4000")
     return conn
 
 
@@ -177,11 +180,13 @@ def iter_memory_files() -> Iterable[tuple[str, Path]]:
                 for path in sorted(memory_dir.rglob("*.md")):
                     yield "claude_memory", path
 
+    # NOTE: CANON_DIR is deliberately NOT indexed as a source. memory/canon/
+    # is a generated view of memory_items; indexing it double-injected the
+    # same memories as both items and chunks (plan B7).
     for pattern, source in [
         (HOME / ".codex/automations", "codex_automation_memory"),
         (HOME / ".clawmail/memory/notes", "clawmail_note"),
         (HOME / ".openclaw/memory/notes", "openclaw_note"),
-        (CANON_DIR, "jmem_memory"),
     ]:
         if not pattern.exists():
             continue
@@ -536,22 +541,30 @@ def index_sources(_: argparse.Namespace | None = None) -> int:
 
 
 def ensure_index() -> None:
-    if not DB_PATH.exists():
-        index_sources(None)
-        return
+    """Hook-safe staleness check: NEVER re-indexes inline (plan 1.10).
+
+    A stale or missing index only touches a marker file; the launchd
+    maintainer (`jmem maintain`) picks it up. Hooks stay read-only and fast.
+    """
+    marker = ROOT / "index" / "reindex-requested"
     try:
+        if not DB_PATH.exists():
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+            return
         conn = connect()
         init_db(conn)
         row = conn.execute("SELECT value FROM metadata WHERE key = 'last_indexed_at'").fetchone()
+        conn.close()
         if not row:
-            index_sources(None)
+            marker.touch()
             return
         last = dt.datetime.fromisoformat(row["value"])
         if last.tzinfo is None:
             last = last.replace(tzinfo=dt.timezone.utc)
         age = (dt.datetime.now(dt.timezone.utc) - last).total_seconds()
         if age > INDEX_MAX_AGE_SECONDS:
-            index_sources(None)
+            marker.touch()
     except Exception:
         return
 
@@ -980,13 +993,131 @@ def retrieve(cwd: str, prompt: str, limit: int = 8) -> list[sqlite3.Row]:
     return [row for _, row in retrieve_with_trace(cwd, prompt, limit).matches]
 
 
-def build_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
-    if prompt.strip().lower() in TRIVIAL_PROMPTS:
-        return ""
-    trace = retrieve_with_trace(cwd, prompt)
-    if not trace.matches and not trace.memory_matches:
-        return ""
+def is_trivial_prompt(prompt: str, min_tokens: int = 3) -> bool:
+    """Prompts with no retrievable intent get no packet (plan 1.3.4)."""
+    stripped = prompt.strip()
+    if not stripped:
+        return True
+    if stripped.lower() in TRIVIAL_PROMPTS:
+        return True
+    if stripped.startswith("/"):
+        return True
+    if len(tokens(stripped)) < min_tokens:
+        return True
+    return False
 
+
+SESSIONS_STATE_DIR = ROOT / "logs" / "sessions"
+
+
+def read_session_state(session_id: str) -> dict:
+    if not session_id:
+        return {"injected": [], "turns": 0}
+    path = SESSIONS_STATE_DIR / f"{session_id}.json"
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data, dict):
+            data.setdefault("injected", [])
+            data.setdefault("turns", 0)
+            return data
+    except Exception:
+        pass
+    return {"injected": [], "turns": 0}
+
+
+def write_session_state(session_id: str, state: dict) -> None:
+    if not session_id:
+        return
+    try:
+        SESSIONS_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path = SESSIONS_STATE_DIR / f"{session_id}.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        return
+
+
+def session_is_holdout(session_id: str) -> bool:
+    """Deterministic A/B holdout (plan 2.1.5): 1-in-N sessions get no
+    injection so injected vs uninjected sessions can be compared."""
+    from jmem.config import get_config
+
+    if not session_id:
+        return False
+    holdout = get_config()["holdout"]
+    if not holdout.get("enabled", True):
+        return False
+    modulus = max(int(holdout.get("modulus", 4)), 2)
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return int(digest, 16) % modulus == 0
+
+
+def select_packet(trace: RetrievalTrace, session_id: str = "") -> dict:
+    """Apply relevance gating, adaptive budget, and session-delta filtering
+    (plan 1.3). Returns selected rows plus bookkeeping for the hook log."""
+    from jmem.config import get_config
+
+    cfg = get_config()["retrieval"]
+    state = read_session_state(session_id)
+    already = set(state.get("injected", []))
+    first_turn = state.get("turns", 0) == 0
+    q_terms = trace.query_terms
+
+    memory_sel: list[tuple[float, sqlite3.Row]] = []
+    for score, row in trace.memory_matches:
+        key = f"m:{row['id']}"
+        if key in already:
+            continue
+        haystack = f"{row['text']} {row['kind']} {row['scope']}".lower()
+        term_hits = sum(1 for t in q_terms if t in haystack)
+        # After turn 1, scope+confidence alone is not enough — the item
+        # must actually relate to the prompt (plan 1.3.2, provisional).
+        if not first_turn and term_hits == 0:
+            continue
+        memory_sel.append((score, row))
+
+    chunk_min = float(cfg["chunk_min_score"])
+    chunk_sel = [
+        (score, row)
+        for score, row in trace.matches
+        if score >= chunk_min and f"c:{row['id']}" not in already
+    ]
+
+    strong = any(score >= float(cfg["strong_chunk_score"]) for score, _ in chunk_sel) or any(
+        score >= 12.0 for score, _ in memory_sel
+    )
+    if strong:
+        max_chars = int(cfg["max_chars"])
+        snippet_chars = 620
+    else:
+        max_chars = int(cfg["weak_max_chars"])
+        snippet_chars = int(cfg["weak_snippet_chars"])
+        limit = int(cfg["weak_max_items"])
+        combined = sorted(
+            [("m", s, r) for s, r in memory_sel] + [("c", s, r) for s, r in chunk_sel],
+            key=lambda item: item[1],
+            reverse=True,
+        )[:limit]
+        memory_sel = [(s, r) for kind, s, r in combined if kind == "m"]
+        chunk_sel = [(s, r) for kind, s, r in combined if kind == "c"]
+
+    return {
+        "memory": memory_sel,
+        "chunks": chunk_sel,
+        "max_chars": max_chars,
+        "snippet_chars": snippet_chars,
+        "strong": strong,
+        "first_turn": first_turn,
+        "state": state,
+    }
+
+
+def render_packet(trace: RetrievalTrace, selection: dict) -> tuple[str, list[dict]]:
+    """Render selected rows into the packet text. Returns (text, injected)
+    where injected identifies each item for the hook log (plan 2.1.1)."""
+    if not selection["memory"] and not selection["chunks"]:
+        return "", []
     terms = list(dict.fromkeys(trace.query_terms + trace.project_terms))
     lines = [
         "# jmem Ambient Context",
@@ -994,8 +1125,10 @@ def build_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
         "Use this as local memory hints, not guaranteed truth. Verify live repo/service state for volatile facts.",
         "",
     ]
+    injected: list[dict] = []
     used = 0
-    for _, row in trace.memory_matches:
+    max_chars = selection["max_chars"]
+    for score, row in selection["memory"]:
         item = (
             f"## Memory: {row['kind']} ({row['scope']})\n"
             f"- source: jmem_memory\n"
@@ -1008,25 +1141,53 @@ def build_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
             break
         lines.append(item)
         used += len(item)
-    for _, row in trace.matches:
+        injected.append({"id": f"m:{row['id']}", "score": round(score, 2)})
+    for score, row in selection["chunks"]:
         item = (
             f"## {row['title']}\n"
             f"- source: {row['source']}\n"
             f"- path: {row['path']}\n"
-            f"- snippet: {snippet(row['content'], terms)}\n"
+            f"- snippet: {snippet(row['content'], terms, selection['snippet_chars'])}\n"
         )
         if used + len(item) > max_chars:
             break
         lines.append(item)
         used += len(item)
-    return "\n".join(lines).strip()
+        injected.append({"id": f"c:{row['id']}", "score": round(score, 2)})
+    if not injected:
+        return "", []
+    return "\n".join(lines).strip(), injected
+
+
+def build_context(
+    cwd: str,
+    prompt: str,
+    max_chars: int = 6000,
+    session_id: str = "",
+) -> tuple[str, list[dict]]:
+    """Build the injection packet. Returns (text, injected_items)."""
+    from jmem.config import get_config
+
+    if is_trivial_prompt(prompt, int(get_config()["retrieval"]["min_prompt_tokens"])):
+        return "", []
+    trace = retrieve_with_trace(cwd, prompt)
+    selection = select_packet(trace, session_id)
+    context, injected = render_packet(trace, selection)
+    if session_id:
+        state = selection["state"]
+        state["turns"] = int(state.get("turns", 0)) + 1
+        if injected:
+            merged = list(dict.fromkeys(state.get("injected", []) + [i["id"] for i in injected]))
+            state["injected"] = merged[-400:]
+        write_session_state(session_id, state)
+    return context, injected
 
 
 def explain_context(cwd: str, prompt: str, max_chars: int = 6000) -> str:
     trace = retrieve_with_trace(cwd, prompt)
     rows = [row for _, row in trace.matches]
     memory_rows = [row for _, row in trace.memory_matches]
-    context = build_context(cwd, prompt, max_chars)
+    context, _ = build_context(cwd, prompt, max_chars)
     terms = list(dict.fromkeys(trace.query_terms + trace.project_terms))
     lines = [
         "# jmem Retrieval Explain",
@@ -1072,7 +1233,7 @@ def cmd_context(args: argparse.Namespace) -> int:
     if args.explain:
         context = explain_context(args.cwd, prompt or "", args.max_chars)
     else:
-        context = build_context(args.cwd, prompt or "", args.max_chars)
+        context, _ = build_context(args.cwd, prompt or "", args.max_chars)
     if context:
         print(context)
     return 0
@@ -1113,6 +1274,40 @@ def cmd_stats(_: argparse.Namespace) -> int:
         print("memory_items=" + ", ".join(
             f"{r['status']}/{r['kind']}:{r['count']}" for r in memory_rows
         ))
+
+    # Token cost accounting (plan 2.1.3): current log + archived counters
+    # folded in by the maintainer's log rotation.
+    totals = {"events": 0, "ups": 0, "injections": 0, "injected_chars": 0,
+              "gated": 0, "holdout": 0}
+    if LOG_PATH.exists():
+        for line in LOG_PATH.read_text(errors="ignore").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            totals["events"] += 1
+            if record.get("event") == "UserPromptSubmit":
+                totals["ups"] += 1
+                chars = int(record.get("injected_chars") or 0)
+                if chars > 0:
+                    totals["injections"] += 1
+                    totals["injected_chars"] += chars
+                elif record.get("holdout"):
+                    totals["holdout"] += 1
+                elif record.get("gated"):
+                    totals["gated"] += 1
+    for key in ("events", "ups", "injections", "injected_chars"):
+        totals[key] += int(get_metadata(conn, f"archived_{key}") or 0)
+    if totals["ups"]:
+        rate = 100.0 * totals["injections"] / totals["ups"]
+        est_tokens = totals["injected_chars"] // 4
+        print(
+            f"injection: prompts={totals['ups']} injected={totals['injections']} "
+            f"({rate:.1f}%) gated={totals['gated']} holdout={totals['holdout']}"
+        )
+        print(
+            f"tokens_injected~={est_tokens:,} (chars={totals['injected_chars']:,}, est chars/4)"
+        )
     return 0
 
 
@@ -1313,10 +1508,8 @@ def extract_candidate_lines(text: str, limit: int = 12) -> list[str]:
             candidates.append(line)
         if len(candidates) >= limit:
             break
-    if not candidates:
-        compact = re.sub(r"\s+", " ", text).strip()
-        if compact:
-            candidates.append(compact[:480])
+    # No verbatim fallback (plan 1.2.1): a missing candidate is strictly
+    # better than a raw prompt stored as "memory".
     return list(dict.fromkeys(candidates))[:limit]
 
 
@@ -1468,26 +1661,68 @@ def append_canon(bucket: str, lines: list[str], source_path: Path) -> Path:
     return path
 
 
+def candidate_block(path: Path) -> str:
+    """Raw material handed to the LLM judge: candidate lines + source excerpt."""
+    lines = candidate_memory_lines(path)
+    excerpt = ""
+    try:
+        text = path.read_text(errors="ignore")
+        match = re.search(r"## Source excerpt\s*```text\n(.*?)```", text, re.DOTALL)
+        if match:
+            excerpt = match.group(1).strip()
+    except Exception:
+        pass
+    parts = []
+    if lines:
+        parts.append("Candidate lines:\n" + "\n".join(f"- {line}" for line in lines))
+    if excerpt:
+        parts.append("Source excerpt:\n" + excerpt[:1500])
+    return "\n\n".join(parts)
+
+
 def consolidate_candidate_file(
     conn: sqlite3.Connection,
     path: Path,
     min_confidence: float,
     dry_run: bool,
+    facts: list[dict] | None = None,
 ) -> dict[str, int]:
+    """Consolidate one candidate file.
+
+    When `facts` is provided (LLM judge output, plan 1.2), those atomic
+    facts are stored. Otherwise the regex classifier runs as the
+    no-network fallback.
+    """
     meta = parse_candidate_frontmatter(path)
     scope = scope_for_cwd(meta.get("cwd") or "")
     counts = {"inserted": 0, "updated": 0, "skipped": 0}
-    for line in candidate_memory_lines(path):
-        kind, confidence = classify_memory(line)
-        if kind == "skip" or confidence < min_confidence:
-            counts["skipped"] += 1
-            continue
+    if facts is not None:
+        judged: list[tuple[str, str, float]] = [
+            (fact["text"], fact["kind"], float(fact["confidence"]))
+            for fact in facts
+            if float(fact.get("confidence", 0.0)) >= min_confidence
+        ]
+        counts["skipped"] = len(facts) - len(judged)
+    else:
+        judged = []
+        for line in candidate_memory_lines(path):
+            kind, confidence = classify_memory(line)
+            if kind == "skip" or confidence < min_confidence:
+                counts["skipped"] += 1
+                continue
+            from jmem.judge import looks_like_template
+
+            if looks_like_template(line):
+                counts["skipped"] += 1
+                continue
+            judged.append((line, kind, confidence))
+    for text, kind, confidence in judged:
         if dry_run:
             counts["inserted"] += 1
             continue
         result, _ = upsert_memory_item(
             conn,
-            text=line,
+            text=text,
             kind=kind,
             scope=scope,
             status="soft",
@@ -1500,13 +1735,41 @@ def consolidate_candidate_file(
 
 
 def consolidate_candidates(args: argparse.Namespace) -> int:
+    from jmem.config import get_config
+    from jmem import judge as judge_mod
+
     conn = connect()
     init_db(conn)
+    config = get_config()
     limit = max(int(getattr(args, "limit", 50) or 0), 0)
     dry_run = bool(getattr(args, "dry_run", False))
     quiet = bool(getattr(args, "quiet", False))
     min_confidence = float(getattr(args, "min_confidence", 0.78))
+    use_judge = bool(getattr(args, "judge", True)) and judge_mod.judge_available(config)
     paths = active_candidate_paths(limit=limit)
+
+    # LLM judge pass (plan 1.2): batch candidate blocks; on judge failure a
+    # batch falls back to the regex path (facts=None).
+    judged_facts: dict[Path, list[dict] | None] = {path: None for path in paths}
+    if use_judge and paths:
+        batch_size = int(config["judge"]["batch_size"])
+        exclude_granola = bool(config["judge"]["exclude_granola"])
+        judgeable = []
+        for path in paths:
+            block = candidate_block(path)
+            if not block:
+                continue
+            if exclude_granola and "granola" in block.lower():
+                continue
+            judgeable.append((path, block))
+        for start in range(0, len(judgeable), batch_size):
+            batch = judgeable[start : start + batch_size]
+            results = judge_mod.extract_facts_from_blocks([b for _, b in batch], config)
+            if results is None:
+                continue
+            for (path, _), facts in zip(batch, results):
+                judged_facts[path] = facts
+
     totals = {
         "processed": 0,
         "inserted": 0,
@@ -1516,7 +1779,9 @@ def consolidate_candidates(args: argparse.Namespace) -> int:
         "rejected_candidates": 0,
     }
     for path in paths:
-        counts = consolidate_candidate_file(conn, path, min_confidence, dry_run)
+        counts = consolidate_candidate_file(
+            conn, path, min_confidence, dry_run, facts=judged_facts.get(path)
+        )
         promoted = counts.get("inserted", 0) + counts.get("updated", 0)
         totals["processed"] += 1
         totals["inserted"] += counts.get("inserted", 0)
@@ -1554,30 +1819,20 @@ def consolidate_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
-def maybe_auto_consolidate(limit: int = 25, debounce_seconds: int = 600) -> None:
-    if os.environ.get("JMEM_DISABLE_AUTO_CONSOLIDATE"):
-        return
-    try:
-        conn = connect()
-        init_db(conn)
-        last = get_metadata(conn, "last_consolidated_at")
-        if last:
-            last_dt = dt.datetime.fromisoformat(last)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=dt.timezone.utc)
-            age = (dt.datetime.now(dt.timezone.utc) - last_dt).total_seconds()
-            if age < debounce_seconds:
-                return
-        args = argparse.Namespace(
-            limit=limit,
-            dry_run=False,
-            quiet=True,
-            min_confidence=0.78,
-            index=False,
-        )
-        consolidate_candidates(args)
-    except Exception:
-        return
+def run_consolidation(limit: int = 200, use_judge: bool = True) -> str:
+    """Consolidation entrypoint for the maintainer (plan 1.10). Hooks no
+    longer consolidate — this runs only from `jmem maintain` or the CLI."""
+    processed = len(active_candidate_paths(limit=limit))
+    args = argparse.Namespace(
+        limit=limit,
+        dry_run=False,
+        quiet=True,
+        min_confidence=0.78,
+        index=False,
+        judge=use_judge,
+    )
+    consolidate_candidates(args)
+    return f"processed:{processed}"
 
 
 def candidate_text_from_event(event: dict) -> tuple[str, str]:
@@ -1705,7 +1960,18 @@ def cmd_candidates_prune(args: argparse.Namespace) -> int:
     return 0
 
 
-def log_hook(event: dict, injected: str, trace: RetrievalTrace | None = None, candidate_path: str = "") -> None:
+def log_hook(
+    event: dict,
+    injected: str,
+    trace: RetrievalTrace | None = None,
+    candidate_path: str = "",
+    *,
+    agent: str = "",
+    injected_items: list[dict] | None = None,
+    gated: str = "",
+    holdout: bool = False,
+    duration_ms: int | None = None,
+) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     top_rows = [row for _, row in trace.matches] if trace else []
     memory_rows = [row for _, row in trace.memory_matches] if trace else []
@@ -1717,11 +1983,16 @@ def log_hook(event: dict, injected: str, trace: RetrievalTrace | None = None, ca
     record = {
         "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "event": event.get("hook_event_name"),
+        "agent": agent,
         "session_id": event.get("session_id"),
         "turn_id": event.get("turn_id"),
         "cwd": event.get("cwd"),
         "prompt_prefix": (event.get("prompt") or "")[:160],
         "injected_chars": len(injected),
+        "injected_items": injected_items or [],
+        "gated": gated,
+        "holdout": holdout,
+        "duration_ms": duration_ms,
         "top_sources": top_sources,
         "top_paths": top_paths,
         "memory_items": len(memory_rows),
@@ -1732,79 +2003,46 @@ def log_hook(event: dict, injected: str, trace: RetrievalTrace | None = None, ca
         fh.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
-def hook_main(argv: list[str]) -> int:
-    mode = argv[0] if argv else ""
-    try:
-        event = json.loads(sys.stdin.read() or "{}")
-    except json.JSONDecodeError:
-        event = {}
+class HookDeadline(Exception):
+    pass
 
-    if mode == "stop" or event.get("hook_event_name") == "Stop":
-        event.setdefault("hook_event_name", "Stop")
-        event.setdefault("cwd", event.get("cwd") or os.getcwd())
-        text, transcript_path = candidate_text_from_event(event)
-        candidate = write_candidate(
-            text,
-            event.get("cwd") or os.getcwd(),
-            source="codex_stop_hook",
-            session_id=str(event.get("session_id") or ""),
-            transcript_path=transcript_path,
-        )
-        if candidate:
-            maybe_auto_consolidate()
-        log_hook(event, "", None, str(candidate) if candidate else "")
-        return 0
 
-    if mode != "user-prompt" and event.get("hook_event_name") != "UserPromptSubmit":
-        return 0
+def _hook_alarm(_signum, _frame):
+    raise HookDeadline()
 
-    prompt = event.get("prompt") or ""
-    cwd = event.get("cwd") or os.getcwd()
-    trace = retrieve_with_trace(cwd, prompt) if prompt.strip().lower() not in TRIVIAL_PROMPTS else None
-    context = build_context(cwd, prompt)
-    log_hook(event, context, trace)
-    if not context:
-        return 0
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": context,
-        }
-    }))
+
+def hooks_disabled() -> bool:
+    """Kill-switch honored as the first check of every hook entrypoint.
+    Set by the LLM judge subprocess (and available manually) so a jmem-
+    spawned claude session can never feed itself (plan 1.2a)."""
+    return bool(os.environ.get("JMEM_HOOKS_DISABLED"))
+
+
+def handle_stop_event(event: dict, agent: str) -> int:
+    started = time.time()
+    event.setdefault("hook_event_name", "Stop")
+    event.setdefault("cwd", event.get("cwd") or os.getcwd())
+    text, transcript_path = candidate_text_from_event(event)
+    candidate = write_candidate(
+        text,
+        event.get("cwd") or os.getcwd(),
+        source=f"{agent}_stop_hook",
+        session_id=str(event.get("session_id") or ""),
+        transcript_path=transcript_path,
+    )
+    # No consolidation here: hooks are read-only against the DB; the
+    # launchd maintainer owns all mutation (plan 1.10).
+    log_hook(
+        event, "", None, str(candidate) if candidate else "",
+        agent=agent, duration_ms=int((time.time() - started) * 1000),
+    )
     return 0
 
 
-def codex_hook_entry() -> int:
-    return hook_main(["user-prompt"])
+def handle_prompt_event(event: dict, agent: str, emit_json: bool) -> int:
+    import signal
 
-
-def claude_hook_main(argv: list[str]) -> int:
-    mode = argv[0] if argv else ""
-    try:
-        event = json.loads(sys.stdin.read() or "{}")
-    except json.JSONDecodeError:
-        event = {}
-
-    hook_event = event.get("hook_event_name") or event.get("hookEventName")
-    if mode == "stop" or hook_event == "Stop":
-        event.setdefault("hook_event_name", "Stop")
-        event.setdefault("cwd", event.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-        text, transcript_path = candidate_text_from_event(event)
-        candidate = write_candidate(
-            text,
-            event.get("cwd") or os.getcwd(),
-            source="claude_stop_hook",
-            session_id=str(event.get("session_id") or ""),
-            transcript_path=transcript_path,
-        )
-        if candidate:
-            maybe_auto_consolidate()
-        log_hook(event, "", None, str(candidate) if candidate else "")
-        return 0
-
-    if mode != "user-prompt" and hook_event != "UserPromptSubmit":
-        return 0
-
+    started = time.time()
     prompt = (
         event.get("prompt")
         or event.get("user_prompt")
@@ -1813,15 +2051,98 @@ def claude_hook_main(argv: list[str]) -> int:
         or ""
     )
     cwd = event.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    trace = retrieve_with_trace(cwd, prompt) if prompt.strip().lower() not in TRIVIAL_PROMPTS else None
-    context = build_context(cwd, prompt)
-    event.setdefault("hook_event_name", hook_event or "UserPromptSubmit")
+    session_id = str(event.get("session_id") or "")
+    event.setdefault("hook_event_name", "UserPromptSubmit")
     event.setdefault("prompt", prompt)
     event.setdefault("cwd", cwd)
-    log_hook(event, context, trace)
-    if context:
+
+    def elapsed_ms() -> int:
+        return int((time.time() - started) * 1000)
+
+    if session_is_holdout(session_id):
+        log_hook(event, "", None, agent=agent, gated="holdout", holdout=True,
+                 duration_ms=elapsed_ms())
+        return 0
+    if is_trivial_prompt(prompt):
+        log_hook(event, "", None, agent=agent, gated="trivial", duration_ms=elapsed_ms())
+        return 0
+
+    context, injected, trace, gated = "", [], None, ""
+    old_handler = signal.signal(signal.SIGALRM, _hook_alarm)
+    signal.alarm(6)
+    try:
+        trace = retrieve_with_trace(cwd, prompt)
+        selection = select_packet(trace, session_id)
+        context, injected = render_packet(trace, selection)
+        if not context:
+            gated = "delta_empty" if not selection["first_turn"] else "below_threshold"
+        if session_id:
+            state = selection["state"]
+            state["turns"] = int(state.get("turns", 0)) + 1
+            if injected:
+                merged = list(dict.fromkeys(
+                    state.get("injected", []) + [i["id"] for i in injected]
+                ))
+                state["injected"] = merged[-400:]
+            write_session_state(session_id, state)
+    except HookDeadline:
+        context, injected, gated = "", [], "timeout"
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+    log_hook(event, context, trace, agent=agent, injected_items=injected,
+             gated=gated, duration_ms=elapsed_ms())
+    if not context:
+        return 0
+    if emit_json:
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": context,
+            }
+        }))
+    else:
         print(context)
     return 0
+
+
+def hook_main(argv: list[str]) -> int:
+    if hooks_disabled():
+        return 0
+    mode = argv[0] if argv else ""
+    try:
+        event = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        event = {}
+    if mode == "stop" or event.get("hook_event_name") == "Stop":
+        return handle_stop_event(event, agent="codex")
+    if mode != "user-prompt" and event.get("hook_event_name") != "UserPromptSubmit":
+        return 0
+    return handle_prompt_event(event, agent="codex", emit_json=True)
+
+
+def codex_hook_entry() -> int:
+    return hook_main(["user-prompt"])
+
+
+def claude_hook_main(argv: list[str]) -> int:
+    if hooks_disabled():
+        return 0
+    mode = argv[0] if argv else ""
+    try:
+        event = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        event = {}
+    hook_event = event.get("hook_event_name") or event.get("hookEventName")
+    if mode == "stop" or hook_event == "Stop":
+        event.setdefault(
+            "cwd", event.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        )
+        return handle_stop_event(event, agent="claude")
+    if mode != "user-prompt" and hook_event != "UserPromptSubmit":
+        return 0
+    return handle_prompt_event(event, agent="claude", emit_json=False)
 
 
 def claude_hook_entry() -> int:
@@ -1857,7 +2178,36 @@ def main() -> int:
     p_consolidate.add_argument("--dry-run", action="store_true")
     p_consolidate.add_argument("--quiet", action="store_true")
     p_consolidate.add_argument("--index", action="store_true", help="Re-index source files after writing the Markdown view")
-    p_consolidate.set_defaults(func=consolidate_candidates)
+    p_consolidate.add_argument("--no-judge", dest="judge", action="store_false",
+                               help="Skip the LLM judge and use the regex fallback")
+    p_consolidate.set_defaults(func=consolidate_candidates, judge=True)
+
+    from jmem import maintain as maintain_mod
+    from jmem.config import write_default_config
+
+    p_maintain = sub.add_parser("maintain", help="Background maintenance: index, granola, consolidate, prune, rotate, backup")
+    p_maintain.set_defaults(func=maintain_mod.cmd_maintain)
+
+    p_backup = sub.add_parser("backup", help="Snapshot the memory DB, canon, and candidates")
+    p_backup.set_defaults(func=maintain_mod.cmd_backup)
+
+    p_restore = sub.add_parser("restore", help="Restore the memory DB from a snapshot")
+    p_restore.add_argument("snapshot", help="Path to a .sqlite snapshot from jmem backup")
+    p_restore.set_defaults(func=maintain_mod.cmd_restore)
+
+    p_migrate = sub.add_parser("migrate-store", help="One-time LLM cleanup of existing memory items (snapshots first)")
+    p_migrate.add_argument("--batch-size", type=int, default=40)
+    p_migrate.add_argument("--dry-run", action="store_true")
+    p_migrate.set_defaults(func=maintain_mod.cmd_migrate_store)
+
+    p_config = sub.add_parser("config-init", help="Write the commented default config.toml")
+    p_config.add_argument("--force", action="store_true")
+    p_config.set_defaults(
+        func=lambda a: (
+            print(write_default_config(ROOT, force=a.force) or f"config exists: {ROOT / 'config.toml'}"),
+            0,
+        )[1]
+    )
 
     p_doctor = sub.add_parser("doctor", help="Check jmem hook, index, Granola, and log health")
     p_doctor.set_defaults(func=cmd_doctor)
