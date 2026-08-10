@@ -49,7 +49,10 @@ wrong), todo (an open commitment).
 REJECT (emit nothing for): assistant narration ("I'll check...", "Let me..."),
 tool output, prompt templates or instructions aimed at a model, one-task
 status ("the tests pass now"), questions, greetings, anything you cannot
-rewrite as a standalone third-person fact.
+rewrite as a standalone third-person fact. Also REJECT general world
+knowledge and public facts a capable model already knows (definitions,
+geography, well-known technical facts) — store ONLY what is specific to
+John, his projects, his contacts, his infrastructure, or his decisions.
 
 Output STRICT JSON only, no prose, no code fences: a JSON array where each
 element is {"block": <int>, "text": "<fact>", "kind": "<kind>",
@@ -68,7 +71,9 @@ into future coding sessions. Verdicts:
 - "rewrite": contains a real durable fact but needs rewriting; provide "text"
   (third-person, self-contained, <=200 chars) and "kind".
 - "tombstone": not a durable fact (prompt echo, template, narration, stale
-  one-task detail, fragment). When in doubt, tombstone.
+  one-task detail, fragment), OR general world knowledge a capable model
+  already knows and is not specific to John, his projects, his contacts,
+  or his decisions. When in doubt, tombstone.
 
 Kinds: preference, decision, project_fact, correction, todo, general.
 
