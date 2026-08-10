@@ -12,6 +12,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import json
+import re
 import shutil
 import sqlite3
 import tarfile
@@ -243,6 +244,9 @@ def cmd_migrate_store(args: argparse.Namespace) -> int:
     """One-time cleanup of existing memory_items via the LLM judge
     (plan 1.2.5). Snapshot-first is non-optional."""
     config = get_config()
+    if getattr(args, "model", ""):
+        config = dict(config)
+        config["judge"] = {**config["judge"], "model": args.model}
     dry_run = bool(getattr(args, "dry_run", False))
     if not judge_mod.judge_available(config):
         print("migrate-store requires the LLM judge (claude CLI) — aborting")
@@ -252,9 +256,10 @@ def cmd_migrate_store(args: argparse.Namespace) -> int:
         print("pre-migration backup: " + " ".join(done))
     conn = core.connect()
     core.init_db(conn)
-    rows = conn.execute(
-        "SELECT id, text, kind FROM memory_items WHERE status = 'soft' ORDER BY id"
-    ).fetchall()
+    query = "SELECT id, text, kind, scope FROM memory_items WHERE status = 'soft' ORDER BY id"
+    if getattr(args, "limit", 0):
+        query += f" LIMIT {int(args.limit)}"
+    rows = conn.execute(query).fetchall()
     print(f"judging {len(rows)} soft items (batches of {args.batch_size})")
     counts = {"keep": 0, "rewrite": 0, "tombstone": 0, "merged": 0, "unjudged": 0}
     now = core.now_utc()
@@ -274,6 +279,10 @@ def cmd_migrate_store(args: argparse.Namespace) -> int:
                 continue
             if dry_run:
                 counts[action] = counts.get(action, 0) + 1
+                preview = re.sub(r"\s+", " ", str(item["text"]))[:90]
+                rewritten = verdict.get("text", "")
+                print(f"    [{item_id}] {action}: {preview}"
+                      + (f" -> {rewritten}" if rewritten else ""))
                 continue
             if action == "tombstone":
                 conn.execute(

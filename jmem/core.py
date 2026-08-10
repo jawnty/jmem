@@ -2198,6 +2198,8 @@ def main() -> int:
     p_migrate = sub.add_parser("migrate-store", help="One-time LLM cleanup of existing memory items (snapshots first)")
     p_migrate.add_argument("--batch-size", type=int, default=40)
     p_migrate.add_argument("--dry-run", action="store_true")
+    p_migrate.add_argument("--limit", type=int, default=0, help="Only judge the first N items (sampling)")
+    p_migrate.add_argument("--model", default="", help="Override the judge model for this run")
     p_migrate.set_defaults(func=maintain_mod.cmd_migrate_store)
 
     p_config = sub.add_parser("config-init", help="Write the commented default config.toml")

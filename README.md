@@ -65,12 +65,15 @@ flowchart TB
 
 Refresh behavior:
 
-- **Lazy scan:** project docs and agent memory are scanned when jmem runs, or
-  when the index is stale.
-- **Auto-poll:** Granola can sync hourly into the gitignored local cache when
-  the optional launchd sync is installed.
-- **Auto-consolidate:** Stop hooks and an optional hourly LaunchAgent promote
-  high-confidence candidate lines into SQLite `memory_items`.
+- **Read-only hooks:** hooks never index or consolidate. A stale index only
+  touches a `reindex-requested` marker; all mutation happens in the hourly
+  `jmem maintain` LaunchAgent (index refresh, Granola sync, LLM
+  consolidation, candidate pruning, log rotation, backups).
+- **Relevance gating:** trivial prompts and weak matches get no packet or a
+  shrunk packet. Within one session, jmem injects the full packet on the
+  first turn and only *new* items on later turns (delta injection).
+- **Holdout:** a deterministic 1-in-N of sessions (default 4) receives no
+  injection at all, so injected vs uninjected sessions can be compared.
 - **Per turn:** each prompt retrieves from the local index; jmem does not
   reread every source live.
 
@@ -151,7 +154,14 @@ jmem context --cwd "$PWD" --prompt "why did morning brief fail?" --explain
 jmem doctor
 jmem trace --limit 5
 jmem consolidate --dry-run
+jmem maintain
+jmem backup
+jmem config-init
 ```
+
+Retrieval thresholds, the holdout fraction, judge model, and maintenance
+knobs live in `config.toml` (see `jmem config-init` for a commented
+template; missing values fall back to defaults).
 
 The context command prints what hooks inject into an agent turn:
 
@@ -276,6 +286,16 @@ memory/candidates/
 That folder is gitignored because candidates can contain private session
 details. You normally do not need to review it; it is mainly for debugging.
 
+Consolidation is an LLM pass by default: `jmem maintain` (or
+`jmem consolidate`) sends candidate blocks to a Claude CLI judge that emits
+zero or more atomic third-person facts per block, rejecting narration,
+templates, and one-task noise. The judge subprocess runs with jmem's hooks
+disabled twice over (a `--settings` override plus a `JMEM_HOOKS_DISABLED=1`
+kill-switch both hook entrypoints honor first) so it can never feed itself,
+and with `ANTHROPIC_API_KEY` stripped so it bills the Claude subscription.
+If the CLI is unavailable, a stricter regex fallback runs; it never stores
+raw text verbatim.
+
 Automatic consolidation writes extracted memories into SQLite first:
 
 ```text
@@ -294,11 +314,15 @@ That folder is also gitignored. Canon files are local views or manually accepted
 memory, not public documentation. Rejected and accepted source candidates are
 moved under `memory/candidates/rejected/` and `memory/candidates/accepted/`.
 
-Install the optional hourly consolidator:
+Install the hourly maintainer (replaces the older consolidate and
+granola-sync agents; also prunes candidates, rotates logs, and backs up):
 
 ```bash
-./scripts/install-consolidate-launchd --load
+./scripts/install-maintain-launchd --load
 ```
+
+Backups land in `backups/` (daily DB + canon snapshots, weekly candidates
+tarball). Restore with `jmem restore <snapshot.sqlite>`.
 
 ## Granola
 

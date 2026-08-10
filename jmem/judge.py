@@ -72,6 +72,10 @@ into future coding sessions. Verdicts:
 
 Kinds: preference, decision, project_fact, correction, todo, general.
 
+Each item is labeled with a scope naming the project it belongs to. When
+rewriting, attribute facts to that project or to John — NEVER to the memory
+system itself (an item scoped project:foo describes foo, not this system).
+
 Output STRICT JSON only, no prose, no code fences: a JSON array where each
 element is {"id": <int>, "verdict": "keep"|"rewrite"|"tombstone",
 "text": "<only for rewrite>", "kind": "<only for rewrite>",
@@ -202,7 +206,9 @@ def judge_existing_items(items: list[dict], config: dict) -> dict[int, dict] | N
     if not items:
         return {}
     numbered = "\n".join(
-        f"[{item['id']}] (kind={item['kind']}) {item['text'][:600]}" for item in items
+        f"[{item['id']}] (kind={item['kind']}, scope={item.get('scope', 'global')}) "
+        f"{item['text'][:600]}"
+        for item in items
     )
     parsed = run_judge(f"{MIGRATE_INSTRUCTIONS}\n{numbered}", config)
     if parsed is None:
