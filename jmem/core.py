@@ -2237,6 +2237,12 @@ def main() -> int:
     p_migrate.add_argument("--model", default="", help="Override the judge model for this run")
     p_migrate.set_defaults(func=maintain_mod.cmd_migrate_store)
 
+    from jmem import brain as brain_mod
+
+    p_brain = sub.add_parser("brain", help="Generate the read-only HTML brain viewer")
+    p_brain.add_argument("--open", action="store_true", help="Open in the default browser")
+    p_brain.set_defaults(func=brain_mod.cmd_brain)
+
     p_config = sub.add_parser("config-init", help="Write the commented default config.toml")
     p_config.add_argument("--force", action="store_true")
     p_config.set_defaults(

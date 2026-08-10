@@ -188,6 +188,13 @@ def run_backup(config: dict, force: bool = False) -> list[str]:
     return done
 
 
+def _render_brain() -> str:
+    from jmem import brain
+
+    brain.write_brain_view()
+    return "rendered"
+
+
 def cmd_backup(args: argparse.Namespace) -> int:
     config = get_config()
     done = run_backup(config, force=True)
@@ -335,6 +342,7 @@ def cmd_maintain(args: argparse.Namespace) -> int:
             ("prune", lambda: prune_candidates(config)),
             ("rotate_log", lambda: rotate_hook_log(config)),
             ("sessions", lambda: clean_session_state(config)),
+            ("brain", lambda: _render_brain()),
             ("backup", lambda: ",".join(run_backup(config)) or "current"),
         ]
         for name, step in steps:
