@@ -1019,6 +1019,98 @@ def is_trivial_prompt(prompt: str, min_tokens: int = 3) -> bool:
     return False
 
 
+def is_followup_prompt(prompt: str, first_turn: bool, min_tokens: int = 5) -> bool:
+    """Short mid-session follow-ups ("no - create a new draft") carry no
+    topic of their own; retrieval matches them loosely and the live thread
+    already holds their context. Never gate a session's first prompt."""
+    if first_turn:
+        return False
+    return len(tokens(prompt)) < min_tokens
+
+
+def session_context(transcript_path: str) -> dict:
+    """What this session still holds verbatim: file paths its tools touched
+    since the last compaction, and when that compaction happened. /clear
+    starts a new session (new transcript), so it resets this naturally."""
+    paths: set[str] = set()
+    compacted_at = None
+    try:
+        with open(transcript_path, encoding="utf-8") as fh:
+            for line in fh:
+                if "compact_boundary" in line:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("subtype") == "compact_boundary":
+                        paths.clear()
+                        compacted_at = entry.get("timestamp")
+                    continue
+                if '"file_path"' in line:
+                    paths.update(re.findall(r'"file_path":\s*"([^"]+)"', line))
+    except (OSError, TypeError):
+        pass
+    return {"paths": paths, "compacted_at": compacted_at}
+
+
+def _candidate_time(source_path: str) -> dt.datetime | None:
+    match = re.match(r"(\d{8}-\d{6})-", Path(source_path).name)
+    if not match:
+        return None
+    return dt.datetime.strptime(match.group(1), "%Y%m%d-%H%M%S").astimezone()
+
+
+def own_session_memory_ids(
+    conn: sqlite3.Connection, session_id: str, compacted_at: str | None
+) -> set[int]:
+    """Memory items whose every piece of evidence came from this session's
+    stop-hook candidates written after the last compaction. Those facts are
+    still in the conversation, so re-injecting them is an echo."""
+    if not session_id:
+        return set()
+    since = None
+    if compacted_at:
+        try:
+            since = dt.datetime.fromisoformat(compacted_at.replace("Z", "+00:00"))
+        except ValueError:
+            since = None
+    evidence: dict[int, list[str]] = {}
+    for mid, source_path in conn.execute(
+        """
+        SELECT memory_id, source_path FROM memory_evidence
+        WHERE memory_id IN (
+            SELECT memory_id FROM memory_evidence WHERE source_path LIKE ?
+        )
+        """,
+        (f"%{session_id}%",),
+    ):
+        evidence.setdefault(int(mid), []).append(str(source_path))
+    own: set[int] = set()
+    for mid, sources in evidence.items():
+        if not all(session_id in src for src in sources):
+            continue
+        if since is not None:
+            times = [_candidate_time(src) for src in sources]
+            if any(t is None or t < since for t in times):
+                continue
+        own.add(mid)
+    return own
+
+
+def session_exclusions(session_id: str, transcript_path: str) -> dict:
+    ctx = session_context(transcript_path) if transcript_path else {
+        "paths": set(), "compacted_at": None,
+    }
+    memory_ids: set[int] = set()
+    if session_id:
+        try:
+            conn = connect()
+            memory_ids = own_session_memory_ids(conn, session_id, ctx["compacted_at"])
+        except sqlite3.Error:
+            memory_ids = set()
+    return {"paths": ctx["paths"], "memory_ids": memory_ids}
+
+
 SESSIONS_STATE_DIR = ROOT / "logs" / "sessions"
 
 
@@ -1065,7 +1157,9 @@ def session_is_holdout(session_id: str) -> bool:
     return int(digest, 16) % modulus == 0
 
 
-def select_packet(trace: RetrievalTrace, session_id: str = "") -> dict:
+def select_packet(
+    trace: RetrievalTrace, session_id: str = "", exclude: dict | None = None
+) -> dict:
     """Apply relevance gating, adaptive budget, and session-delta filtering
     (plan 1.3). Returns selected rows plus bookkeeping for the hook log."""
     from jmem.config import get_config
@@ -1073,13 +1167,16 @@ def select_packet(trace: RetrievalTrace, session_id: str = "") -> dict:
     cfg = get_config()["retrieval"]
     state = read_session_state(session_id)
     already = set(state.get("injected", []))
+    exclude = exclude or {}
+    skip_memory = exclude.get("memory_ids") or set()
+    skip_paths = exclude.get("paths") or set()
     first_turn = state.get("turns", 0) == 0
     q_terms = trace.query_terms
 
     memory_sel: list[tuple[float, sqlite3.Row]] = []
     for score, row in trace.memory_matches:
         key = f"m:{row['id']}"
-        if key in already:
+        if key in already or row["id"] in skip_memory:
             continue
         haystack = f"{row['text']} {row['kind']} {row['scope']}".lower()
         term_hits = sum(1 for t in q_terms if t in haystack)
@@ -1093,7 +1190,9 @@ def select_packet(trace: RetrievalTrace, session_id: str = "") -> dict:
     chunk_sel = [
         (score, row)
         for score, row in trace.matches
-        if score >= chunk_min and f"c:{row['id']}" not in already
+        if score >= chunk_min
+        and f"c:{row['id']}" not in already
+        and row["path"] not in skip_paths
     ]
 
     strong = any(score >= float(cfg["strong_chunk_score"]) for score, _ in chunk_sel) or any(
@@ -2102,12 +2201,25 @@ def handle_prompt_event(event: dict, agent: str, emit_json: bool) -> int:
         log_hook(event, "", None, agent=agent, gated="trivial", duration_ms=elapsed_ms())
         return 0
 
+    from jmem.config import get_config
+
+    followup_min = int(get_config()["retrieval"]["followup_min_tokens"])
+    first_turn = read_session_state(session_id).get("turns", 0) == 0
+    if is_followup_prompt(prompt, first_turn, followup_min):
+        if session_id:
+            state = read_session_state(session_id)
+            state["turns"] = int(state.get("turns", 0)) + 1
+            write_session_state(session_id, state)
+        log_hook(event, "", None, agent=agent, gated="followup", duration_ms=elapsed_ms())
+        return 0
+
     context, injected, trace, gated = "", [], None, ""
     old_handler = signal.signal(signal.SIGALRM, _hook_alarm)
     signal.alarm(6)
     try:
         trace = retrieve_with_trace(cwd, prompt)
-        selection = select_packet(trace, session_id)
+        exclude = session_exclusions(session_id, str(event.get("transcript_path") or ""))
+        selection = select_packet(trace, session_id, exclude)
         context, injected = render_packet(trace, selection)
         if not context:
             gated = "delta_empty" if not selection["first_turn"] else "below_threshold"

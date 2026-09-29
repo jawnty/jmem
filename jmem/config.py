@@ -27,6 +27,9 @@ DEFAULTS: dict = {
         "weak_max_items": 3,
         "weak_snippet_chars": 300,
         "min_prompt_tokens": 3,
+        # After turn 1, prompts with fewer content tokens are follow-ups
+        # and get no packet (2026-09-28 precision dip: loose matches).
+        "followup_min_tokens": 5,
     },
     "holdout": {
         # Deterministic A/B holdout: sessions where
@@ -69,6 +72,7 @@ CONFIG_TEMPLATE = """\
 # weak_max_items = 3
 # weak_snippet_chars = 300
 # min_prompt_tokens = 3        # prompts with fewer content tokens are gated
+# followup_min_tokens = 5      # after turn 1, shorter prompts are gated as follow-ups
 
 [holdout]
 # enabled = true               # deterministic per-session A/B holdout
