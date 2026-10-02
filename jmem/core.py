@@ -206,30 +206,6 @@ def iter_memory_files() -> Iterable[tuple[str, Path]]:
             yield source, path
 
 
-def iter_granola_local_cache() -> Iterable[tuple[str, str, str]]:
-    cache_path = HOME / "Library/Application Support/Granola/cache-v6.json"
-    if not cache_path.exists():
-        return
-    try:
-        data = json.loads(cache_path.read_text(errors="ignore"))
-    except Exception:
-        return
-    state = data.get("cache", {}).get("state", {})
-    documents = state.get("documents") or state.get("documentLists") or {}
-    if isinstance(documents, dict):
-        for doc_id, doc in documents.items():
-            if not isinstance(doc, dict):
-                continue
-            title = str(doc.get("title") or doc.get("name") or doc_id)
-            bits = []
-            for key in ("title", "summary", "notes", "transcript", "text"):
-                value = doc.get(key)
-                if isinstance(value, str) and value.strip():
-                    bits.append(value.strip())
-            if bits:
-                yield ("granola_local", f"granola:{doc_id}", title + "\n\n" + "\n\n".join(bits))
-
-
 def granola_api_token() -> str | None:
     for key in ("GRANOLA_API_KEY", "GRANOLA_TOKEN"):
         value = os.environ.get(key)
@@ -529,11 +505,6 @@ def index_sources(_: argparse.Namespace | None = None) -> int:
         files += 1
         seen_paths.add(str(path))
         changed += upsert_document(conn, source, str(path), title_for(path, text), text, path.stat().st_mtime)
-
-    for source, path, text in iter_granola_local_cache():
-        files += 1
-        seen_paths.add(path)
-        changed += upsert_document(conn, source, path, path, text, time.time())
 
     if seen_paths:
         placeholders = ",".join("?" for _ in seen_paths)
