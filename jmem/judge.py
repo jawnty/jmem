@@ -220,6 +220,10 @@ def run_judge(prompt: str, config: dict) -> list[dict] | None:
     model = str(config.get("judge", {}).get("model", "haiku"))
     timeout = int(config.get("judge", {}).get("timeout_seconds", 240))
     settings_path = _settings_override_path()
+    # Run claude in an empty folder. Under launchd the inherited cwd is "/",
+    # and claude's startup scan from there reaches Downloads, Photos and other
+    # apps' data, which pops macOS permission dialogs blamed on python.
+    work_dir = tempfile.mkdtemp(prefix="jmem-judge-cwd-")
     try:
         result = subprocess.run(
             ["claude", "-p", "--model", model, "--settings", settings_path],
@@ -228,6 +232,7 @@ def run_judge(prompt: str, config: dict) -> list[dict] | None:
             text=True,
             timeout=timeout,
             env=_isolated_env(),
+            cwd=work_dir,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -236,6 +241,7 @@ def run_judge(prompt: str, config: dict) -> list[dict] | None:
             os.unlink(settings_path)
         except OSError:
             pass
+        shutil.rmtree(work_dir, ignore_errors=True)
     if result.returncode != 0:
         return None
     parsed = _parse_json_array(result.stdout)
