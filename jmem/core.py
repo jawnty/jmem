@@ -398,11 +398,23 @@ def sync_granola_notes(args: argparse.Namespace) -> int:
     failed = 0
     for idx, (note_id, title) in enumerate(note_ids.items(), start=1):
         path = GRANOLA_CACHE_DIR / f"{note_id}.md"
-        if path.exists() and not args.force:
+        gone_marker = GRANOLA_CACHE_DIR / f"{note_id}.gone"
+        if (path.exists() or gone_marker.exists()) and not args.force:
             skipped += 1
             continue
         try:
             detail = granola_get_json(f"/notes/{note_id}", token, {"include": "transcript"})
+        except urllib.error.HTTPError as exc:
+            # A 404 means the note was deleted in Granola. Remember that so
+            # the hourly sync stops retrying it and reporting failed=1.
+            if exc.code == 404:
+                gone_marker.write_text(f"{exc}\n", encoding="utf-8")
+                skipped += 1
+                continue
+            failed += 1
+            if args.verbose:
+                print(f"failed {note_id}: {exc}", file=sys.stderr)
+            continue
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             failed += 1
             if args.verbose:
